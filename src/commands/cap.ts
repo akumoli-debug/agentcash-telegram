@@ -24,9 +24,6 @@ export function createCapCommand(deps: {
 
       const user = deps.db.upsertUser({
         telegramUserId: String(from.id),
-        username: from.username ?? null,
-        firstName: from.first_name ?? null,
-        lastName: from.last_name ?? null,
         defaultSpendCapUsdc: deps.config.DEFAULT_SPEND_CAP_USDC
       });
       const chatId = String(ctx.chat?.id ?? from.id);

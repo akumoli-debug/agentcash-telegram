@@ -4,6 +4,7 @@ import {
   AppError,
   InsufficientBalanceError,
   NotFoundError,
+  QuoteError,
   SpendingCapError,
   TimeoutError,
   ValidationError
@@ -25,6 +26,10 @@ function buildErrorMessage(error: unknown): string {
 
   if (error instanceof InsufficientBalanceError) {
     return "Insufficient balance. Use /deposit to fund your wallet, then try again.";
+  }
+
+  if (error instanceof QuoteError) {
+    return error.message;
   }
 
   if (error instanceof SpendingCapError) {

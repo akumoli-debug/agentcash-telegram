@@ -54,10 +54,10 @@ export async function executeSkillRequest(
       userId: user.id,
       telegramChatId: executionContext.telegramChatId,
       currentCommand: deps.skillName,
-      stateJson: JSON.stringify(result.pending)
+      stateJson: JSON.stringify({ type: "quote_confirmation", quote_id: result.quoteId })
     });
 
-    await ctx.reply(result.text, confirmationKeyboard(result.pending.token));
+    await ctx.reply(result.text, confirmationKeyboard(result.quoteId));
     return;
   }
 

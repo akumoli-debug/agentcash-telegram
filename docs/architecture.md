@@ -4,7 +4,7 @@
 
 - TypeScript
 - Node 20+
-- `pnpm` package management to match the surrounding Merit repos more closely than Bun
+- `pnpm` package management
 - `telegraf` for Telegram transport
 - `better-sqlite3` for local persistence
 - `zod` for configuration and command validation
@@ -12,79 +12,91 @@
 
 ## Modules
 
-- `src/index.ts`
-  - process bootstrap
-  - config loading
-  - db initialization
-  - bot startup and shutdown
-- `src/config.ts`
-  - env parsing and runtime config
-- `src/bot.ts`
-  - Telegraf bot creation and command registration
-- `src/db/*`
-  - schema creation and typed SQLite access
-- `src/wallets/walletManager.ts`
-  - wallet records, spend caps, deposit QR generation
-- `src/agentcash/agentcashClient.ts`
-  - boundary to AgentCash CLI integration
-- `src/commands/*`
-  - per-command handlers
-- `src/lib/*`
-  - logger and app errors
+- `src/index.ts` — process bootstrap, config, startup health check, bot lifecycle
+- `src/config.ts` — env parsing and runtime config
+- `src/bot.ts` — Telegraf bot creation, middleware, command registration, confirm/cancel handlers
+- `src/db/schema.ts` — SQLite schema definitions
+- `src/db/client.ts` — typed SQLite access, quote operations, preflight logging, history query
+- `src/wallets/walletManager.ts` — wallet records, spend caps, per-user locking for provisioning
+- `src/agentcash/agentcashClient.ts` — **single boundary for AgentCash CLI integration** (startup health check here)
+- `src/agentcash/skillExecutor.ts` — quote creation, confirmation flow, approved-quote execution
+- `src/commands/*` — per-command handlers
+- `src/lib/userLock.ts` — per-user async lock (prevents concurrent wallet provisioning and double-execution)
+- `src/lib/crypto.ts` — AES-256-GCM encryption, HMAC hashing
+- `src/lib/errors.ts` — typed error classes including `QuoteError`
+- `src/lib/logger.ts` — pino with secret redaction
+- `src/router/routerClient.ts` — optional NL router (OpenAI or Anthropic), always produces forceConfirmation
 
 ## Data Model
 
-The schema is deliberately group-ready, but runtime logic only provisions user-owned wallets for now.
+```
+users               — Telegram user ID for lookup, cap settings (no personal names)
+delivery_identities — user_hash → telegram_user_id (PII isolated here)
+wallets             — per-user wallet metadata, encrypted private key
+quotes              — immutable quote record per paid call attempt
+transactions        — execution audit trail linked to quotes
+preflight_attempts  — failed quote/balance/cap/replay attempts
+sessions            — active quote_id per chat (for confirm/cancel routing)
+request_events      — rate limit event log (pruned after 2 hours)
+```
 
-- `users`
-  - Telegram identity and display metadata
-- `wallets`
-  - `kind` supports `user` and `group`
-  - current implementation only creates `user`
-- `transactions`
-  - command-level audit trail and payment metadata
-- `sessions`
-  - simple per-chat conversational state for future multi-step flows
+Group wallets are a schema affordance (`wallets.kind IN ('user','group')`) but not implemented in runtime code.
 
-## AgentCash integration strategy
+## Paid command execution flow
 
-Current scaffold assumes a subprocess adapter over the CLI boundary first.
+Every paid call through `/research`, `/enrich`, `/generate`, or NL routing goes through this sequence:
 
-Reasons:
+1. **Validate input** — Zod validator on raw user input
+2. **Get wallet** — provision or retrieve via `walletManager.getOrCreateWalletForTelegramUser`; locked per user hash
+3. **Get balance** — `agentcashClient.getBalance`
+4. **Get quote** — `agentcashClient.checkEndpoint` must return a bounded cost estimate
+   - If check fails and `ALLOW_UNQUOTED_DEV_CALLS=false`: log preflight failure, throw `QuoteError`
+   - If `ALLOW_UNQUOTED_DEV_CALLS=true`: mark `is_dev_unquoted=1`, proceed with cost=0
+5. **Check hard cap** — reject if cost > `HARD_SPEND_CAP_USDC`
+6. **Check balance** — reject if balance insufficient
+7. **Create quote record** — immutable DB row with canonical request JSON and request hash
+8. **Confirmation gate** — if cost > user cap or `forceConfirmation`: return `quote_id` to bot for inline keyboard
+   - Auto-approve and execute immediately if below cap
+9. **Approved execution** (`executeApprovedQuote`) — loads canonical request from quote row, not from user input
+   - Atomically marks `approved` (SQL `WHERE status='pending'`)
+   - Creates transaction record
+   - Calls `agentcashClient.fetchJson`
+   - Marks `executed`, links transaction ID
+10. **Audit** — all failures update quote status and log to `preflight_attempts`
 
-- Merit repos expose AgentCash primarily through CLI/MCP flows
-- wallet isolation needs explicit per-user control
-- app-level spend cap enforcement should happen before a paid fetch
+## Confirmation flow (security detail)
 
-## Wallet isolation
+The session stores only:
+```json
+{ "type": "quote_confirmation", "quote_id": "quo_..." }
+```
 
-- each Telegram user gets a deterministic hashed AgentCash home directory under `data/agentcash-homes/`
-- folder names are derived from a keyed hash, never the raw Telegram ID
-- the app injects wallet secrets through env vars at execution time when needed
-- encrypted wallet secret material is stored with AES-256-GCM using `MASTER_ENCRYPTION_KEY`
-- raw wallet secrets are never logged
+The confirm callback (`confirm:<quote_id>`) is verified against the session. The quote row is the source of truth — not re-parsed user input. Replay protection is at the SQL level: `UPDATE WHERE status='pending'` returns 0 changes if already used.
 
-## Paid command execution
+## AgentCash CLI dependency
 
-`/research`, `/enrich`, and `/generate` all flow through one shared executor:
+All CLI interactions are in `agentcashClient.ts`. Startup health check verifies:
+1. CLI binary is executable
+2. Home root directory is writable
 
-1. validate input
-2. load isolated wallet
-3. check balance
-4. estimate cost from `check` or a deterministic fallback
-5. enforce user spend cap
-6. execute the paid request
-7. store only hashes plus transaction metadata
-8. format a concise Telegram response
+If either fails, the process exits with a clear error before accepting Telegram traffic.
 
-TODO seams are called out in:
+## PII boundary
 
-- `src/agentcash/agentcashClient.ts`
-- `src/wallets/walletManager.ts`
+| Table | Contains |
+|---|---|
+| `delivery_identities` | raw `telegram_user_id` → `user_hash` |
+| `users` | `telegram_user_id` (for session lookup), cap settings |
+| `wallets` | `user_hash` (as `home_dir_hash`), encrypted key |
+| `quotes` | `user_hash` only |
+| `transactions` | `user_hash` as `telegram_id_hash` and `telegram_chat_id` |
+| `preflight_attempts` | `user_hash` only |
+
+No usernames, first names, or last names are stored anywhere.
 
 ## Privacy and logging
 
-- never log raw private keys
-- never log raw Telegram message text by default
-- avoid logging usernames, first names, and last names together unless operationally necessary
-- transaction logs may store structured request metadata, but command handlers should prefer summaries over raw user text
+- Never log raw private keys, wallet secrets, or signed payloads
+- Never log raw Telegram message text
+- Transaction and audit logs store hashes, not raw content
+- Pino redaction covers: private keys, API keys, encrypted inputs, session state, raw CLI output

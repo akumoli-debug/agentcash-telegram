@@ -13,18 +13,19 @@ import { createResearchCommand } from "./commands/research.js";
 import { createEnrichCommand } from "./commands/enrich.js";
 import { createGenerateCommand } from "./commands/generate.js";
 import { createCapCommand } from "./commands/cap.js";
+import { createHistoryCommand } from "./commands/history.js";
 import { executeSkillRequest } from "./commands/skillCommand.js";
 import {
   assertPrivateChatContext,
   ensureUserRecord,
   confirmationKeyboard,
   getCallbackData,
-  isPendingConfirmationExpired,
-  parsePendingConfirmation,
+  parseSessionQuoteState,
   replyWithSkillResult
 } from "./commands/helpers.js";
 import { replyWithError } from "./commands/replyWithError.js";
 import { RouterClient, extractSkillInput } from "./router/routerClient.js";
+import { QuoteError } from "./lib/errors.js";
 
 export function createBot(deps: {
   config: AppConfig;
@@ -45,11 +46,7 @@ export function createBot(deps: {
       : undefined;
 
     deps.logger.info(
-      {
-        updateType: ctx.updateType,
-        chatIdHash,
-        telegramIdHash
-      },
+      { updateType: ctx.updateType, chatIdHash, telegramIdHash },
       "incoming Telegram update"
     );
     await next();
@@ -62,6 +59,12 @@ export function createBot(deps: {
     }
 
     const user = ensureUserRecord(deps.db, ctx, deps.config.DEFAULT_SPEND_CAP_USDC);
+
+    if (ctx.from.id) {
+      const userHash = hashTelegramId(String(ctx.from.id), deps.config.MASTER_ENCRYPTION_KEY);
+      deps.db.upsertDeliveryIdentity(userHash, String(ctx.from.id));
+    }
+
     const result = deps.db.checkAndRecordRateLimit(user.id, {
       eventName: ctx.updateType,
       maxPerMinute: deps.config.RATE_LIMIT_MAX_PER_MINUTE,
@@ -99,6 +102,8 @@ export function createBot(deps: {
   bot.command("research", createResearchCommand(deps));
   bot.command("enrich", createEnrichCommand(deps));
   bot.command("generate", createGenerateCommand(deps));
+  bot.command("history", createHistoryCommand(deps));
+
   bot.on("text", async ctx => {
     const text = ctx.message.text.trim();
 
@@ -116,12 +121,9 @@ export function createBot(deps: {
         return;
       }
 
-      if (
-        decision.skill === "none" ||
-        decision.confidence < deps.config.ROUTER_CONFIDENCE_THRESHOLD
-      ) {
+      if (decision.skill === "none" || decision.confidence < deps.config.ROUTER_CONFIDENCE_THRESHOLD) {
         await ctx.reply(
-          "I’m not confident enough to route that safely. Use /research <query>, /enrich <email>, or /generate <prompt>."
+          "I'm not confident enough to route that safely. Use /research <query>, /enrich <email>, or /generate <prompt>."
         );
         return;
       }
@@ -137,12 +139,7 @@ export function createBot(deps: {
 
       await executeSkillRequest(
         ctx,
-        {
-          config: deps.config,
-          db: deps.db,
-          skillExecutor: deps.skillExecutor,
-          skillName: decision.skill
-        },
+        { config: deps.config, db: deps.db, skillExecutor: deps.skillExecutor, skillName: decision.skill },
         rawInput,
         { forceConfirmation: true }
       );
@@ -150,24 +147,18 @@ export function createBot(deps: {
       await replyWithError(ctx, error);
     }
   });
+
   bot.action(/^confirm:/, async ctx => {
     try {
       const data = getCallbackData(ctx);
-      const token = data.slice("confirm:".length);
+      const quoteId = data.slice("confirm:".length);
       const { telegramId, chatId } = assertPrivateChatContext(ctx);
       const user = deps.walletManager.getExistingUser(telegramId);
       const session = deps.db.getSession(user.id, chatId);
-      const pending = parsePendingConfirmation(session);
+      const sessionState = parseSessionQuoteState(session);
 
-      if (!pending || pending.token !== token) {
+      if (!sessionState || sessionState.quote_id !== quoteId) {
         await ctx.answerCbQuery("This confirmation is no longer valid.");
-        return;
-      }
-
-      if (isPendingConfirmationExpired(pending)) {
-        deps.db.clearSessionState(user.id, chatId);
-        await ctx.answerCbQuery("This confirmation expired.");
-        await ctx.reply("That pending confirmation expired. Please rerun the command.");
         return;
       }
 
@@ -180,52 +171,40 @@ export function createBot(deps: {
 
       await ctx.answerCbQuery("Confirmed.");
 
-      const result = await deps.skillExecutor.execute(
-        pending.skill,
-        deps.skillExecutor.decryptPendingInput(pending),
-        {
-          telegramId,
-          telegramProfile: {
-            username: ctx.from?.username ?? null,
-            firstName: ctx.from?.first_name ?? null,
-            lastName: ctx.from?.last_name ?? null
-          },
-          telegramChatId: chatId,
-          telegramMessageId:
-            ctx.callbackQuery && "message" in ctx.callbackQuery && ctx.callbackQuery.message
-              ? String(ctx.callbackQuery.message.message_id)
-              : null,
-          confirmed: true
-        }
-      );
-
-      if (result.type === "confirmation_required") {
-        deps.db.upsertSession({
-          userId: user.id,
-          telegramChatId: chatId,
-          currentCommand: pending.skill,
-          stateJson: JSON.stringify(result.pending)
-        });
-
-        await ctx.reply(result.text, confirmationKeyboard(result.pending.token));
-        return;
-      }
+      const result = await deps.skillExecutor.executeApprovedQuote(quoteId, {
+        telegramId,
+        telegramProfile: {
+          username: ctx.from?.username ?? null,
+          firstName: ctx.from?.first_name ?? null,
+          lastName: ctx.from?.last_name ?? null
+        },
+        telegramChatId: chatId,
+        telegramMessageId:
+          ctx.callbackQuery && "message" in ctx.callbackQuery && ctx.callbackQuery.message
+            ? String(ctx.callbackQuery.message.message_id)
+            : null
+      });
 
       await replyWithSkillResult(ctx, result);
     } catch (error) {
+      if (error instanceof QuoteError) {
+        await ctx.reply(error.message);
+        return;
+      }
       await replyWithError(ctx, error);
     }
   });
+
   bot.action(/^cancel:/, async ctx => {
     try {
       const data = getCallbackData(ctx);
-      const token = data.slice("cancel:".length);
+      const quoteId = data.slice("cancel:".length);
       const { telegramId, chatId } = assertPrivateChatContext(ctx);
       const user = deps.walletManager.getExistingUser(telegramId);
       const session = deps.db.getSession(user.id, chatId);
-      const pending = parsePendingConfirmation(session);
+      const sessionState = parseSessionQuoteState(session);
 
-      if (!pending || pending.token !== token) {
+      if (!sessionState || sessionState.quote_id !== quoteId) {
         await ctx.answerCbQuery("This confirmation is no longer valid.");
         return;
       }
@@ -237,6 +216,7 @@ export function createBot(deps: {
         return;
       }
 
+      deps.db.updateQuoteStatus(quoteId, "cancelled");
       await ctx.answerCbQuery("Cancelled.");
       await ctx.reply("Pending call cancelled.");
     } catch (error) {

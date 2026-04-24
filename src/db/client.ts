@@ -31,6 +31,49 @@ export interface WalletRow {
   updated_at: string;
 }
 
+export interface QuoteRow {
+  id: string;
+  user_hash: string;
+  wallet_id: string;
+  skill: string;
+  endpoint: string;
+  canonical_request_json: string;
+  request_hash: string;
+  quoted_cost_cents: number;
+  max_approved_cost_cents: number;
+  is_dev_unquoted: number;
+  status: "pending" | "approved" | "executed" | "expired" | "cancelled" | "failed";
+  created_at: string;
+  expires_at: string;
+  approved_at: string | null;
+  executed_at: string | null;
+  transaction_id: string | null;
+}
+
+export interface QuoteInput {
+  userHash: string;
+  walletId: string;
+  skill: string;
+  endpoint: string;
+  canonicalRequestJson: string;
+  requestHash: string;
+  quotedCostCents: number;
+  maxApprovedCostCents: number;
+  isDevUnquoted: boolean;
+  expiresAt: string;
+}
+
+export interface PreflightAttemptInput {
+  userHash: string;
+  walletId?: string | null;
+  skill: string;
+  endpoint?: string | null;
+  requestHash?: string | null;
+  failureStage: "wallet" | "balance" | "quote" | "cap" | "execution" | "replay" | "expired";
+  errorCode: string;
+  safeErrorMessage: string;
+}
+
 export interface SessionRow {
   id: string;
   user_id: string;
@@ -59,6 +102,7 @@ export interface TransactionInput {
   skill?: string | null;
   origin?: string | null;
   endpoint?: string | null;
+  quoteId?: string | null;
   status: "pending" | "quoted" | "submitted" | "success" | "error";
   quotedPriceUsdc?: number | null;
   actualPriceUsdc?: number | null;
@@ -73,6 +117,17 @@ export interface TransactionInput {
   errorMessage?: string | null;
 }
 
+export interface HistoryEntry {
+  id: string;
+  skill: string | null;
+  status: string;
+  quoted_price_usdc: number | null;
+  actual_cost_cents: number | null;
+  created_at: string;
+  error_code: string | null;
+  is_dev_unquoted: number | null;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -85,8 +140,10 @@ export class AppDatabase {
   readonly sqlite: Database.Database;
 
   constructor(databasePath: string) {
-    const resolvedPath = path.resolve(databasePath);
-    fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+    const resolvedPath = databasePath === ":memory:" ? ":memory:" : path.resolve(databasePath);
+    if (resolvedPath !== ":memory:") {
+      fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+    }
     this.sqlite = new Database(resolvedPath);
     this.sqlite.pragma("journal_mode = WAL");
     this.sqlite.pragma("foreign_keys = ON");
@@ -107,6 +164,7 @@ export class AppDatabase {
     this.ensureTransactionColumn("actual_cost_cents", "INTEGER");
     this.ensureTransactionColumn("request_hash", "TEXT");
     this.ensureTransactionColumn("response_hash", "TEXT");
+    this.ensureTransactionColumn("quote_id", "TEXT");
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS request_events (
         id TEXT PRIMARY KEY,
@@ -120,6 +178,56 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS request_events_user_created_at_idx
       ON request_events(user_id, created_at DESC)
     `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS quotes (
+        id TEXT PRIMARY KEY,
+        user_hash TEXT NOT NULL,
+        wallet_id TEXT NOT NULL,
+        skill TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        canonical_request_json TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        quoted_cost_cents INTEGER NOT NULL,
+        max_approved_cost_cents INTEGER NOT NULL,
+        is_dev_unquoted INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        approved_at TEXT,
+        executed_at TEXT,
+        transaction_id TEXT
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS quotes_user_hash_created_at_idx
+      ON quotes(user_hash, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS preflight_attempts (
+        id TEXT PRIMARY KEY,
+        user_hash TEXT NOT NULL,
+        wallet_id TEXT,
+        skill TEXT NOT NULL,
+        endpoint TEXT,
+        request_hash TEXT,
+        failure_stage TEXT NOT NULL,
+        error_code TEXT NOT NULL,
+        safe_error_message TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS preflight_attempts_user_hash_idx
+      ON preflight_attempts(user_hash, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS delivery_identities (
+        user_hash TEXT PRIMARY KEY,
+        telegram_user_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      )
+    `);
   }
 
   close() {
@@ -128,9 +236,6 @@ export class AppDatabase {
 
   upsertUser(input: {
     telegramUserId: string;
-    username?: string | null;
-    firstName?: string | null;
-    lastName?: string | null;
     defaultSpendCapUsdc: number;
   }): UserRow {
     const existing = this.getUserByTelegramId(input.telegramUserId);
@@ -138,47 +243,36 @@ export class AppDatabase {
 
     if (existing) {
       this.sqlite
-        .prepare(
-          `
-            UPDATE users
-            SET username = ?, first_name = ?, last_name = ?, updated_at = ?
-            WHERE telegram_user_id = ?
-          `
-        )
-        .run(
-          input.username ?? null,
-          input.firstName ?? null,
-          input.lastName ?? null,
-          timestamp,
-          input.telegramUserId
-        );
-
+        .prepare(`UPDATE users SET updated_at = ? WHERE telegram_user_id = ?`)
+        .run(timestamp, input.telegramUserId);
       return this.getUserByTelegramId(input.telegramUserId)!;
     }
 
     const id = makeId("usr");
-
     this.sqlite
       .prepare(
         `
           INSERT INTO users (
             id, telegram_user_id, username, first_name, last_name, cap_enabled, default_spend_cap_usdc, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
         `
       )
-      .run(
-        id,
-        input.telegramUserId,
-        input.username ?? null,
-        input.firstName ?? null,
-        input.lastName ?? null,
-        1,
-        input.defaultSpendCapUsdc,
-        timestamp,
-        timestamp
-      );
+      .run(id, input.telegramUserId, 1, input.defaultSpendCapUsdc, timestamp, timestamp);
 
     return this.getUserByTelegramId(input.telegramUserId)!;
+  }
+
+  upsertDeliveryIdentity(userHash: string, telegramUserId: string): void {
+    const timestamp = nowIso();
+    this.sqlite
+      .prepare(
+        `
+          INSERT INTO delivery_identities (user_hash, telegram_user_id, created_at, last_seen_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(user_hash) DO UPDATE SET last_seen_at = ?
+        `
+      )
+      .run(userHash, telegramUserId, timestamp, timestamp, timestamp);
   }
 
   getUserByTelegramId(telegramUserId: string): UserRow | undefined {
@@ -219,6 +313,10 @@ export class AppDatabase {
     return this.sqlite
       .prepare("SELECT * FROM wallets WHERE owner_user_id = ? AND kind = 'user' LIMIT 1")
       .get(userId) as WalletRow | undefined;
+  }
+
+  getWalletById(id: string): WalletRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM wallets WHERE id = ?").get(id) as WalletRow | undefined;
   }
 
   createUserWallet(
@@ -296,6 +394,100 @@ export class AppDatabase {
       );
 
     return this.sqlite.prepare("SELECT * FROM wallets WHERE id = ?").get(id) as WalletRow;
+  }
+
+  createQuote(input: QuoteInput): QuoteRow {
+    const id = makeId("quo");
+    const timestamp = nowIso();
+
+    this.sqlite
+      .prepare(
+        `
+          INSERT INTO quotes (
+            id, user_hash, wallet_id, skill, endpoint, canonical_request_json, request_hash,
+            quoted_cost_cents, max_approved_cost_cents, is_dev_unquoted, status,
+            created_at, expires_at, approved_at, executed_at, transaction_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL)
+        `
+      )
+      .run(
+        id,
+        input.userHash,
+        input.walletId,
+        input.skill,
+        input.endpoint,
+        input.canonicalRequestJson,
+        input.requestHash,
+        input.quotedCostCents,
+        input.maxApprovedCostCents,
+        input.isDevUnquoted ? 1 : 0,
+        timestamp,
+        input.expiresAt
+      );
+
+    return this.sqlite.prepare("SELECT * FROM quotes WHERE id = ?").get(id) as QuoteRow;
+  }
+
+  getQuote(id: string): QuoteRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM quotes WHERE id = ?").get(id) as QuoteRow | undefined;
+  }
+
+  /**
+   * Atomically transitions a quote from 'pending' to 'approved'.
+   * Returns true only if the transition succeeded (prevents replay attacks).
+   */
+  atomicApproveQuote(id: string): boolean {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE quotes
+          SET status = 'approved', approved_at = ?
+          WHERE id = ? AND status = 'pending' AND expires_at > ?
+        `
+      )
+      .run(nowIso(), id, nowIso()) as { changes: number };
+
+    return result.changes > 0;
+  }
+
+  updateQuoteStatus(
+    id: string,
+    status: QuoteRow["status"],
+    extras?: { executedAt?: string; transactionId?: string }
+  ): void {
+    this.sqlite
+      .prepare(
+        `
+          UPDATE quotes
+          SET status = ?, executed_at = COALESCE(?, executed_at), transaction_id = COALESCE(?, transaction_id)
+          WHERE id = ?
+        `
+      )
+      .run(status, extras?.executedAt ?? null, extras?.transactionId ?? null, id);
+  }
+
+  logPreflightAttempt(input: PreflightAttemptInput): void {
+    this.sqlite
+      .prepare(
+        `
+          INSERT INTO preflight_attempts (
+            id, user_hash, wallet_id, skill, endpoint, request_hash,
+            failure_stage, error_code, safe_error_message, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      )
+      .run(
+        makeId("pfa"),
+        input.userHash,
+        input.walletId ?? null,
+        input.skill,
+        input.endpoint ?? null,
+        input.requestHash ?? null,
+        input.failureStage,
+        input.errorCode,
+        input.safeErrorMessage,
+        nowIso()
+      );
   }
 
   upsertSession(input: {
@@ -470,9 +662,9 @@ export class AppDatabase {
         `
           INSERT INTO transactions (
             id, user_id, wallet_id, session_id, telegram_chat_id, telegram_message_id, telegram_id_hash, command_name,
-            skill, origin, endpoint, status, quoted_price_usdc, actual_price_usdc, estimated_cost_cents, actual_cost_cents, tx_hash,
+            skill, origin, endpoint, quote_id, status, quoted_price_usdc, actual_price_usdc, estimated_cost_cents, actual_cost_cents, tx_hash,
             request_hash, response_hash, request_summary, response_summary, error_code, error_message, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `
       )
       .run(
@@ -487,6 +679,7 @@ export class AppDatabase {
         input.skill ?? null,
         input.origin ?? null,
         input.endpoint ?? null,
+        input.quoteId ?? null,
         input.status,
         input.quotedPriceUsdc ?? null,
         input.actualPriceUsdc ?? null,
@@ -523,7 +716,7 @@ export class AppDatabase {
         `
           UPDATE transactions
           SET wallet_id = ?, session_id = ?, telegram_chat_id = ?, telegram_message_id = ?, telegram_id_hash = ?,
-              command_name = ?, skill = ?, origin = ?, endpoint = ?, status = ?, quoted_price_usdc = ?,
+              command_name = ?, skill = ?, origin = ?, endpoint = ?, quote_id = ?, status = ?, quoted_price_usdc = ?,
               actual_price_usdc = ?, estimated_cost_cents = ?, actual_cost_cents = ?, tx_hash = ?,
               request_hash = ?, response_hash = ?, request_summary = ?, response_summary = ?, error_code = ?,
               error_message = ?, updated_at = ?
@@ -540,6 +733,7 @@ export class AppDatabase {
         input.skill ?? current.skill ?? null,
         input.origin ?? current.origin ?? null,
         input.endpoint ?? current.endpoint ?? null,
+        input.quoteId ?? current.quote_id ?? null,
         input.status ?? current.status ?? null,
         input.quotedPriceUsdc ?? current.quoted_price_usdc ?? null,
         input.actualPriceUsdc ?? current.actual_price_usdc ?? null,
@@ -557,6 +751,29 @@ export class AppDatabase {
       );
 
     return this.sqlite.prepare("SELECT * FROM transactions WHERE id = ?").get(id);
+  }
+
+  getHistoryForUser(telegramIdHash: string, limit = 10): HistoryEntry[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT
+            t.id,
+            t.skill,
+            t.status,
+            t.quoted_price_usdc,
+            t.actual_cost_cents,
+            t.created_at,
+            t.error_code,
+            q.is_dev_unquoted
+          FROM transactions t
+          LEFT JOIN quotes q ON t.quote_id = q.id
+          WHERE t.telegram_id_hash = ?
+          ORDER BY t.created_at DESC
+          LIMIT ?
+        `
+      )
+      .all(telegramIdHash, limit) as HistoryEntry[];
   }
 
   private ensureWalletColumn(name: string, type: string) {

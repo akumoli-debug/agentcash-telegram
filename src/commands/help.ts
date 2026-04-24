@@ -15,8 +15,10 @@ export function createHelpCommand() {
         "/research <query> - run the research skill",
         "/enrich <email> - run the enrichment skill",
         "/generate <prompt> - run the image generation skill",
+        "/history - show your last 10 transactions",
         "",
-        "Calls above your cap ask for confirmation. Calls above the MVP hard cap are blocked."
+        "Calls above your cap ask for confirmation. Calls above the MVP hard cap are blocked.",
+        "Every paid call creates an immutable quote record before execution."
       ].join("\n")
     );
   };

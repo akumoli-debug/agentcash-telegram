@@ -67,3 +67,10 @@ export class RateLimitError extends AppError {
     this.name = "RateLimitError";
   }
 }
+
+export class QuoteError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super("QUOTE_ERROR", message, { status: 402, details });
+    this.name = "QuoteError";
+  }
+}

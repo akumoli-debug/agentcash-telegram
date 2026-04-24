@@ -1,24 +1,17 @@
 import type { Context } from "telegraf";
 import { Markup } from "telegraf";
 import { z } from "zod";
-import { type PendingConfirmation, type SkillExecutionContext } from "../agentcash/skillExecutor.js";
+import type { SkillExecutionContext } from "../agentcash/skillExecutor.js";
 import type { AppDatabase, SessionRow, UserRow } from "../db/client.js";
 import { AppError, ValidationError } from "../lib/errors.js";
 import type { TelegramProfile } from "../wallets/walletManager.js";
 
-const pendingConfirmationSchema = z.object({
-  version: z.literal(1),
-  type: z.literal("skill_confirmation"),
-  token: z.string().min(1),
-  skill: z.enum(["research", "enrich", "generate"]),
-  endpoint: z.string().url(),
-  sanitizedSummary: z.string().min(1),
-  encryptedInput: z.string().min(1),
-  requestHash: z.string().min(1),
-  telegramIdHash: z.string().min(1),
-  estimatedCostCents: z.number().int().positive().optional(),
-  expiresAt: z.string().datetime()
+const sessionQuoteStateSchema = z.object({
+  type: z.literal("quote_confirmation"),
+  quote_id: z.string().min(1)
 });
+
+export type SessionQuoteState = z.infer<typeof sessionQuoteStateSchema>;
 
 export function getCommandArgument(ctx: Context): string {
   const text = ctx.message && "text" in ctx.message ? ctx.message.text : "";
@@ -65,31 +58,28 @@ export function ensureUserRecord(db: AppDatabase, ctx: Context, defaultSpendCapU
 
   return db.upsertUser({
     telegramUserId: String(from.id),
-    username: from.username ?? null,
-    firstName: from.first_name ?? null,
-    lastName: from.last_name ?? null,
     defaultSpendCapUsdc
   });
 }
 
-export function parsePendingConfirmation(session?: SessionRow): PendingConfirmation | null {
+export function parseSessionQuoteState(session?: SessionRow): SessionQuoteState | null {
   if (!session?.state_json) {
     return null;
   }
 
-  const parsed = pendingConfirmationSchema.safeParse(JSON.parse(session.state_json));
-  return parsed.success ? parsed.data : null;
+  try {
+    const parsed = sessionQuoteStateSchema.safeParse(JSON.parse(session.state_json));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
 }
 
-export function isPendingConfirmationExpired(pending: PendingConfirmation, now = new Date()): boolean {
-  return Date.parse(pending.expiresAt) <= now.getTime();
-}
-
-export function confirmationKeyboard(token: string) {
+export function confirmationKeyboard(quoteId: string) {
   return Markup.inlineKeyboard([
     [
-      Markup.button.callback("Confirm", `confirm:${token}`),
-      Markup.button.callback("Cancel", `cancel:${token}`)
+      Markup.button.callback("Confirm", `confirm:${quoteId}`),
+      Markup.button.callback("Cancel", `cancel:${quoteId}`)
     ]
   ]);
 }
@@ -99,9 +89,7 @@ export async function replyWithSkillResult(
   result: { text: string; imageUrl?: string }
 ): Promise<void> {
   if (result.imageUrl) {
-    await ctx.replyWithPhoto(result.imageUrl, {
-      caption: result.text
-    });
+    await ctx.replyWithPhoto(result.imageUrl, { caption: result.text });
     return;
   }
 

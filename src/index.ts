@@ -15,17 +15,23 @@ async function main() {
   db.initialize();
 
   const agentcashClient = new AgentCashClient(config);
+
+  logger.info("running AgentCash CLI health check...");
+  try {
+    await agentcashClient.healthCheck();
+    logger.info("AgentCash CLI health check passed");
+  } catch (error) {
+    logger.error(
+      { err: error instanceof Error ? { name: error.name, message: error.message } : { message: String(error) } },
+      "AgentCash CLI health check failed — startup aborted"
+    );
+    process.exit(1);
+  }
+
   const walletManager = new WalletManager(db, config, agentcashClient);
   const skillExecutor = new SkillExecutor(db, walletManager, agentcashClient, logger, config);
   const routerClient = new RouterClient(config, logger);
-  const bot = createBot({
-    config,
-    logger,
-    db,
-    walletManager,
-    skillExecutor,
-    routerClient
-  });
+  const bot = createBot({ config, logger, db, walletManager, skillExecutor, routerClient });
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "shutting down");
@@ -33,13 +39,8 @@ async function main() {
     db.close();
   };
 
-  process.once("SIGINT", () => {
-    void shutdown("SIGINT");
-  });
-
-  process.once("SIGTERM", () => {
-    void shutdown("SIGTERM");
-  });
+  process.once("SIGINT", () => { void shutdown("SIGINT"); });
+  process.once("SIGTERM", () => { void shutdown("SIGTERM"); });
 
   if (config.BOT_MODE === "webhook") {
     await bot.launch({
@@ -52,11 +53,7 @@ async function main() {
       }
     });
     logger.info(
-      {
-        mode: "webhook",
-        webhookPath: config.WEBHOOK_PATH,
-        webhookPort: config.WEBHOOK_PORT
-      },
+      { mode: "webhook", webhookPath: config.WEBHOOK_PATH, webhookPort: config.WEBHOOK_PORT },
       "agentcash-telegram bot started"
     );
     return;

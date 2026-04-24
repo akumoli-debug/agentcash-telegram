@@ -1,10 +1,13 @@
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { AppConfig } from "../config.js";
 import type { WalletRow } from "../db/client.js";
 import { decryptSecret, encryptSecret } from "../lib/crypto.js";
-import { AgentCashError, TimeoutError } from "../lib/errors.js";
+import { AgentCashError, ConfigError, TimeoutError } from "../lib/errors.js";
+
+const execFileAsync = promisify(execFile);
 
 export interface AgentCashBalanceResult {
   address?: string;
@@ -44,6 +47,42 @@ interface WalletCommandInput {
 
 export class AgentCashClient {
   constructor(private readonly config: AppConfig) {}
+
+  /**
+   * Startup health check — call before accepting requests.
+   * Verifies the CLI binary is reachable and the home root is writable.
+   * Throws ConfigError with a clear message if any check fails.
+   *
+   * NOTE: All CLI interactions are intentionally encapsulated here.
+   * If AgentCash changes its CLI interface, this is the only file to update.
+   */
+  async healthCheck(): Promise<void> {
+    try {
+      await execFileAsync(this.config.AGENTCASH_COMMAND, ["--version"], {
+        timeout: 10_000,
+        env: { ...process.env }
+      });
+    } catch {
+      throw new ConfigError(
+        `AgentCash CLI not found or not executable: ${this.config.AGENTCASH_COMMAND}. ` +
+        "Set AGENTCASH_COMMAND and ensure the CLI is installed."
+      );
+    }
+
+    const homeRoot = path.resolve(this.config.AGENTCASH_HOME_ROOT);
+    fs.mkdirSync(homeRoot, { recursive: true });
+
+    const testFile = path.join(homeRoot, ".write-test");
+    try {
+      fs.writeFileSync(testFile, "ok");
+      fs.rmSync(testFile, { force: true });
+    } catch {
+      throw new ConfigError(
+        `AgentCash home root is not writable: ${homeRoot}. ` +
+        "Check AGENTCASH_HOME_ROOT and directory permissions."
+      );
+    }
+  }
 
   async ensureWallet(wallet: WalletRow): Promise<AgentCashWalletResult> {
     const homeDir = this.getHomeDir(wallet);

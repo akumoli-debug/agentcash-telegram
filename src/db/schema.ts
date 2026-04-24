@@ -13,6 +13,14 @@ export const schemaStatements = [
     )
   `,
   `
+    CREATE TABLE IF NOT EXISTS delivery_identities (
+      user_hash TEXT PRIMARY KEY,
+      telegram_user_id TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL
+    )
+  `,
+  `
     CREATE TABLE IF NOT EXISTS wallets (
       id TEXT PRIMARY KEY,
       kind TEXT NOT NULL CHECK (kind IN ('user', 'group')),
@@ -44,6 +52,35 @@ export const schemaStatements = [
     WHERE home_dir_hash IS NOT NULL
   `,
   `
+    CREATE TABLE IF NOT EXISTS quotes (
+      id TEXT PRIMARY KEY,
+      user_hash TEXT NOT NULL,
+      wallet_id TEXT NOT NULL,
+      skill TEXT NOT NULL,
+      endpoint TEXT NOT NULL,
+      canonical_request_json TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      quoted_cost_cents INTEGER NOT NULL,
+      max_approved_cost_cents INTEGER NOT NULL,
+      is_dev_unquoted INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','executed','expired','cancelled','failed')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      approved_at TEXT,
+      executed_at TEXT,
+      transaction_id TEXT,
+      FOREIGN KEY (wallet_id) REFERENCES wallets(id)
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS quotes_user_hash_created_at_idx
+    ON quotes(user_hash, created_at DESC)
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS quotes_status_expires_at_idx
+    ON quotes(status, expires_at)
+  `,
+  `
     CREATE TABLE IF NOT EXISTS transactions (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -56,6 +93,7 @@ export const schemaStatements = [
       skill TEXT,
       origin TEXT,
       endpoint TEXT,
+      quote_id TEXT,
       status TEXT NOT NULL CHECK (status IN ('pending', 'quoted', 'submitted', 'success', 'error')),
       quoted_price_usdc REAL,
       actual_price_usdc REAL,
@@ -72,7 +110,8 @@ export const schemaStatements = [
       updated_at TEXT NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id),
       FOREIGN KEY (wallet_id) REFERENCES wallets(id),
-      FOREIGN KEY (session_id) REFERENCES sessions(id)
+      FOREIGN KEY (session_id) REFERENCES sessions(id),
+      FOREIGN KEY (quote_id) REFERENCES quotes(id)
     )
   `,
   `
@@ -82,6 +121,24 @@ export const schemaStatements = [
   `
     CREATE INDEX IF NOT EXISTS transactions_telegram_hash_created_at_idx
     ON transactions(telegram_id_hash, created_at DESC)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS preflight_attempts (
+      id TEXT PRIMARY KEY,
+      user_hash TEXT NOT NULL,
+      wallet_id TEXT,
+      skill TEXT NOT NULL,
+      endpoint TEXT,
+      request_hash TEXT,
+      failure_stage TEXT NOT NULL CHECK (failure_stage IN ('wallet','balance','quote','cap','execution','replay','expired')),
+      error_code TEXT NOT NULL,
+      safe_error_message TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS preflight_attempts_user_hash_idx
+    ON preflight_attempts(user_hash, created_at DESC)
   `,
   `
     CREATE TABLE IF NOT EXISTS sessions (

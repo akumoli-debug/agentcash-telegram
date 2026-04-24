@@ -1,14 +1,15 @@
-import crypto from "node:crypto";
 import { z } from "zod";
 import type { AppConfig } from "../config.js";
 import { AppDatabase, type WalletRow } from "../db/client.js";
-import { decryptSecret, encryptSecret, hashSensitiveValue, hashTelegramId } from "../lib/crypto.js";
+import { hashSensitiveValue, hashTelegramId } from "../lib/crypto.js";
 import {
   AgentCashError,
   InsufficientBalanceError,
+  QuoteError,
   SpendingCapError,
   ValidationError
 } from "../lib/errors.js";
+import { withUserLock } from "../lib/userLock.js";
 import type { AppLogger } from "../lib/logger.js";
 import { WalletManager, type TelegramProfile } from "../wallets/walletManager.js";
 import { AgentCashClient, type AgentCashFetchResult } from "./agentcashClient.js";
@@ -20,7 +21,6 @@ export interface SkillExecutionContext {
   telegramProfile?: TelegramProfile;
   telegramChatId: string;
   telegramMessageId?: string | null;
-  confirmed?: boolean;
   forceConfirmation?: boolean;
 }
 
@@ -31,35 +31,23 @@ export interface SkillRenderResult {
   actualCostCents?: number;
 }
 
-export interface PendingConfirmation {
-  version: 1;
-  type: "skill_confirmation";
-  token: string;
+export interface QuoteConfirmationResult {
+  type: "confirmation_required";
+  text: string;
+  quoteId: string;
   skill: SkillName;
-  endpoint: string;
-  sanitizedSummary: string;
-  encryptedInput: string;
-  requestHash: string;
-  telegramIdHash: string;
-  estimatedCostCents?: number;
-  costMayVary?: boolean;
+  quotedCostCents: number;
   expiresAt: string;
+  isDevUnquoted: boolean;
 }
 
-type SkillExecutionResult =
-  | {
-      type: "confirmation_required";
-      text: string;
-      pending: PendingConfirmation;
-    }
-  | ({
-      type: "completed";
-    } & SkillRenderResult);
+export type SkillExecutionResult =
+  | QuoteConfirmationResult
+  | ({ type: "completed" } & SkillRenderResult);
 
 interface SkillDefinition<TInput> {
   name: SkillName;
   endpoint: string;
-  fallbackEstimatedCostCents?: number;
   mayVary: boolean;
   validator: z.ZodType<TInput>;
   buildBody: (input: TInput) => Record<string, unknown>;
@@ -74,15 +62,14 @@ const researchValidator = z.string().trim().min(3, "Please provide a research qu
 const enrichValidator = z.string().trim().email("Please provide a valid email address.");
 const generateValidator = z.string().trim().min(3, "Please provide an image prompt.");
 
-export const researchSkill: SkillDefinition<string> = {
+const researchSkill: SkillDefinition<string> = {
   name: "research",
   endpoint: "https://stableenrich.dev/api/exa/search",
-  fallbackEstimatedCostCents: 1,
   mayVary: false,
   validator: researchValidator,
   buildBody: query => ({
-    query,
     numResults: 5,
+    query,
     type: "neural"
   }),
   sanitizeInput: (_query, requestHash) => `research:${requestHash.slice(0, 12)}`,
@@ -90,9 +77,7 @@ export const researchSkill: SkillDefinition<string> = {
     const results = extractResultItems(fetchResult.data).slice(0, 3);
 
     if (results.length === 0) {
-      return {
-        text: "Research completed, but no matching results were returned."
-      };
+      return { text: "Research completed, but no matching results were returned." };
     }
 
     return {
@@ -106,15 +91,12 @@ export const researchSkill: SkillDefinition<string> = {
   }
 };
 
-export const enrichSkill: SkillDefinition<string> = {
+const enrichSkill: SkillDefinition<string> = {
   name: "enrich",
   endpoint: "https://stableenrich.dev/api/apollo/people-enrich",
-  fallbackEstimatedCostCents: 5,
   mayVary: false,
   validator: enrichValidator,
-  buildBody: email => ({
-    email
-  }),
+  buildBody: email => ({ email }),
   sanitizeInput: (_email, requestHash) => `enrich:${requestHash.slice(0, 12)}`,
   formatResult: async fetchResult => {
     const object = firstObject(fetchResult.data) ?? {};
@@ -127,27 +109,19 @@ export const enrichSkill: SkillDefinition<string> = {
     ].filter(Boolean) as string[];
 
     if (lines.length === 0) {
-      return {
-        text: "Enrichment completed, but no concise profile fields were available."
-      };
+      return { text: "Enrichment completed, but no concise profile fields were available." };
     }
 
-    return {
-      text: ["Enrichment result:", ...lines].join("\n")
-    };
+    return { text: ["Enrichment result:", ...lines].join("\n") };
   }
 };
 
-export const generateSkill: SkillDefinition<string> = {
+const generateSkill: SkillDefinition<string> = {
   name: "generate",
   endpoint: "https://stablestudio.dev/api/generate/nano-banana/generate",
-  fallbackEstimatedCostCents: 4,
   mayVary: false,
   validator: generateValidator,
-  buildBody: prompt => ({
-    prompt,
-    aspectRatio: "1:1"
-  }),
+  buildBody: prompt => ({ aspectRatio: "1:1", prompt }),
   sanitizeInput: (_prompt, requestHash) => `generate:${requestHash.slice(0, 12)}`,
   formatResult: async (fetchResult, helpers) => {
     let workingResult = fetchResult;
@@ -169,9 +143,7 @@ export const generateSkill: SkillDefinition<string> = {
     }
 
     return {
-      text: imageUrl
-        ? "Image generation completed."
-        : "Generation completed. No image URL was returned.",
+      text: imageUrl ? "Image generation completed." : "Generation completed. No image URL was returned.",
       imageUrl
     };
   }
@@ -209,115 +181,311 @@ export class SkillExecutor {
     }
 
     const body = skill.buildBody(input.data);
-    const telegramIdHash = hashTelegramId(
-      context.telegramId,
-      this.config.MASTER_ENCRYPTION_KEY
-    );
-    const requestHash = hashSensitiveValue(
-      JSON.stringify(body),
-      this.config.MASTER_ENCRYPTION_KEY
-    );
-    const sanitizedSummary = skill.sanitizeInput(input.data, requestHash);
+    const canonicalJson = canonicalizeJson(body);
+    const userHash = hashTelegramId(context.telegramId, this.config.MASTER_ENCRYPTION_KEY);
+    const requestHash = hashSensitiveValue(canonicalJson, this.config.MASTER_ENCRYPTION_KEY);
 
-    const { user, wallet } = await this.walletManager.getOrCreateWalletForTelegramUser(
-      context.telegramId,
-      context.telegramProfile
-    );
-    const balance = await this.agentcashClient.getBalance(wallet);
-    const checkResult = await this.agentcashClient
-      .checkEndpoint(wallet, skill.endpoint, body)
-      .catch(() => ({ estimatedCostCents: undefined, raw: null }));
-    const costMayVary = checkResult.estimatedCostCents === undefined;
+    return withUserLock(userHash, async () => {
+      const { user, wallet } = await this._getWallet(context, userHash, skill.name);
 
-    const estimatedCostCents =
-      checkResult.estimatedCostCents ?? skill.fallbackEstimatedCostCents;
+      const balance = await this._getBalance(wallet, userHash, skill.name);
 
-    if (
-      !this.config.ALLOW_HIGH_VALUE_CALLS &&
-      estimatedCostCents !== undefined &&
-      estimatedCostCents > Math.round(this.config.HARD_SPEND_CAP_USDC * 100)
-    ) {
-      throw new SpendingCapError("This request exceeds the hard MVP safety cap.", {
-        estimatedCostCents,
-        hardCapCents: Math.round(this.config.HARD_SPEND_CAP_USDC * 100)
-      });
-    }
+      const { quotedCostCents, isDevUnquoted } = await this._getQuote(
+        wallet,
+        skill,
+        body,
+        userHash,
+        requestHash
+      );
 
-    if (
-      estimatedCostCents !== undefined &&
-      typeof balance.usdcBalance === "number" &&
-      balance.usdcBalance * 100 < estimatedCostCents
-    ) {
-      throw new InsufficientBalanceError("Your AgentCash wallet does not have enough balance.", {
-        balanceUsdc: balance.usdcBalance,
-        estimatedCostCents
-      });
-    }
+      const hardCapCents = Math.round(this.config.HARD_SPEND_CAP_USDC * 100);
 
-    const confirmationCap = this.walletManager.getConfirmationCap(user);
-    if (
-      !context.confirmed &&
-      (
-        context.forceConfirmation ||
-        (
-          confirmationCap !== undefined &&
-          estimatedCostCents !== undefined &&
-          estimatedCostCents > Math.round(confirmationCap * 100)
-        )
-      )
-    ) {
-      const estimatedLine = estimatedCostCents
-        ? `This ${skill.name} call is estimated at ${formatUsdCents(estimatedCostCents)}${costMayVary ? " and the final amount may vary." : "."}`
-        : `This ${skill.name} call may incur a paid AgentCash charge.`;
-      const capLine =
-        confirmationCap !== undefined
-          ? `Your current per-call cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
-          : "Natural language requests always require confirmation before payment.";
-
-      return {
-        type: "confirmation_required",
-        text: [
-          estimatedLine,
-          capLine,
-          "Confirm to continue or cancel to stop."
-        ].join("\n"),
-        pending: {
-          version: 1,
-          type: "skill_confirmation",
-          token: crypto.randomUUID(),
+      if (!this.config.ALLOW_HIGH_VALUE_CALLS && quotedCostCents > hardCapCents) {
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: wallet.id,
           skill: skill.name,
           endpoint: skill.endpoint,
-          sanitizedSummary,
-          encryptedInput: encryptSecret(rawInput, this.config.MASTER_ENCRYPTION_KEY),
           requestHash,
-          telegramIdHash,
-          estimatedCostCents,
-          costMayVary,
-          expiresAt: new Date(
-            Date.now() + this.config.PENDING_CONFIRMATION_TTL_SECONDS * 1000
-          ).toISOString()
-        }
-      };
+          failureStage: "cap",
+          errorCode: "HARD_CAP_EXCEEDED",
+          safeErrorMessage: "Request exceeds hard MVP safety cap"
+        });
+        throw new SpendingCapError("This request exceeds the hard MVP safety cap.", {
+          quotedCostCents,
+          hardCapCents
+        });
+      }
+
+      if (
+        typeof balance.usdcBalance === "number" &&
+        balance.usdcBalance * 100 < quotedCostCents
+      ) {
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: wallet.id,
+          skill: skill.name,
+          endpoint: skill.endpoint,
+          requestHash,
+          failureStage: "balance",
+          errorCode: "INSUFFICIENT_BALANCE",
+          safeErrorMessage: "Wallet balance below quoted cost"
+        });
+        throw new InsufficientBalanceError("Your AgentCash wallet does not have enough balance.", {
+          balanceUsdc: balance.usdcBalance,
+          quotedCostCents
+        });
+      }
+
+      const maxApprovedCostCents = Math.min(Math.max(quotedCostCents * 2, quotedCostCents + 10), hardCapCents);
+      const expiresAt = new Date(
+        Date.now() + this.config.PENDING_CONFIRMATION_TTL_SECONDS * 1000
+      ).toISOString();
+
+      const quote = this.db.createQuote({
+        userHash,
+        walletId: wallet.id,
+        skill: skill.name,
+        endpoint: skill.endpoint,
+        canonicalRequestJson: canonicalJson,
+        requestHash,
+        quotedCostCents,
+        maxApprovedCostCents,
+        isDevUnquoted,
+        expiresAt
+      });
+
+      const confirmationCap = this.walletManager.getConfirmationCap(user);
+      const needsConfirmation =
+        context.forceConfirmation ||
+        (confirmationCap !== undefined && quotedCostCents > Math.round(confirmationCap * 100));
+
+      if (needsConfirmation) {
+        const costLine = isDevUnquoted
+          ? `This ${skill.name} call may incur a charge (dev mode: price unknown).`
+          : `This ${skill.name} call is quoted at ${formatUsdCents(quotedCostCents)}.`;
+        const capLine =
+          confirmationCap !== undefined
+            ? `Your per-call confirmation cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
+            : "Natural language requests always require confirmation.";
+        const expiryMin = Math.ceil(this.config.PENDING_CONFIRMATION_TTL_SECONDS / 60);
+
+        return {
+          type: "confirmation_required",
+          text: [
+            costLine,
+            capLine,
+            `This confirmation expires in ${expiryMin} minute${expiryMin !== 1 ? "s" : ""}.`,
+            "Confirm to proceed or cancel to stop."
+          ].join("\n"),
+          quoteId: quote.id,
+          skill: skill.name,
+          quotedCostCents,
+          expiresAt: quote.expires_at,
+          isDevUnquoted
+        };
+      }
+
+      const approved = this.db.atomicApproveQuote(quote.id);
+      if (!approved) {
+        throw new QuoteError("Quote could not be approved. Please try again.");
+      }
+
+      return this._runApprovedQuote(quote.id, wallet, JSON.parse(canonicalJson) as Record<string, unknown>, skill, userHash);
+    });
+  }
+
+  /**
+   * Executes a quote that was previously created and shown to the user for confirmation.
+   * Called from the bot's confirm callback handler — NOT from execute().
+   */
+  async executeApprovedQuote(
+    quoteId: string,
+    context: SkillExecutionContext
+  ): Promise<{ type: "completed" } & SkillRenderResult> {
+    const userHash = hashTelegramId(context.telegramId, this.config.MASTER_ENCRYPTION_KEY);
+
+    return withUserLock(userHash, async () => {
+      const quote = this.db.getQuote(quoteId);
+
+      if (!quote) {
+        this.db.logPreflightAttempt({
+          userHash,
+          skill: "unknown",
+          failureStage: "replay",
+          errorCode: "QUOTE_NOT_FOUND",
+          safeErrorMessage: "Quote not found during confirm"
+        });
+        throw new QuoteError("This confirmation is no longer valid.");
+      }
+
+      if (quote.user_hash !== userHash) {
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: quote.wallet_id,
+          skill: quote.skill,
+          failureStage: "replay",
+          errorCode: "QUOTE_OWNER_MISMATCH",
+          safeErrorMessage: "Quote ownership mismatch during confirm"
+        });
+        throw new QuoteError("This confirmation does not belong to your account.");
+      }
+
+      if (quote.status !== "pending") {
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: quote.wallet_id,
+          skill: quote.skill,
+          failureStage: "replay",
+          errorCode: `QUOTE_STATUS_${quote.status.toUpperCase()}`,
+          safeErrorMessage: `Replay attempt on quote with status=${quote.status}`
+        });
+        throw new QuoteError("This confirmation has already been used or has expired.");
+      }
+
+      if (new Date(quote.expires_at) <= new Date()) {
+        this.db.updateQuoteStatus(quoteId, "expired");
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: quote.wallet_id,
+          skill: quote.skill,
+          failureStage: "expired",
+          errorCode: "QUOTE_EXPIRED",
+          safeErrorMessage: "Quote expired before confirmation"
+        });
+        throw new QuoteError("This confirmation has expired. Please rerun the command.");
+      }
+
+      const approved = this.db.atomicApproveQuote(quoteId);
+      if (!approved) {
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: quote.wallet_id,
+          skill: quote.skill,
+          failureStage: "replay",
+          errorCode: "ATOMIC_APPROVE_FAILED",
+          safeErrorMessage: "Atomic approve failed — concurrent confirm attempt"
+        });
+        throw new QuoteError("This confirmation was already used.");
+      }
+
+      const wallet = this.db.getWalletById(quote.wallet_id);
+      if (!wallet) {
+        throw new AgentCashError("Wallet not found for this confirmation.");
+      }
+
+      const skill = this.getSkillDefinition(quote.skill as SkillName);
+      const requestBody = JSON.parse(quote.canonical_request_json) as Record<string, unknown>;
+
+      return this._runApprovedQuote(quoteId, wallet, requestBody, skill, userHash);
+    });
+  }
+
+  private async _getWallet(
+    context: SkillExecutionContext,
+    userHash: string,
+    skillName: string
+  ) {
+    try {
+      return await this.walletManager.getOrCreateWalletForTelegramUser(
+        context.telegramId,
+        context.telegramProfile
+      );
+    } catch (error) {
+      this.db.logPreflightAttempt({
+        userHash,
+        skill: skillName,
+        failureStage: "wallet",
+        errorCode: error instanceof Error ? (error as { code?: string }).code ?? "WALLET_ERROR" : "WALLET_ERROR",
+        safeErrorMessage: "Wallet provisioning failed"
+      });
+      throw error;
     }
+  }
+
+  private async _getBalance(wallet: WalletRow, userHash: string, skillName: string) {
+    try {
+      return await this.agentcashClient.getBalance(wallet);
+    } catch (error) {
+      this.db.logPreflightAttempt({
+        userHash,
+        walletId: wallet.id,
+        skill: skillName,
+        failureStage: "balance",
+        errorCode: error instanceof Error ? (error as { code?: string }).code ?? "BALANCE_ERROR" : "BALANCE_ERROR",
+        safeErrorMessage: "Balance lookup failed"
+      });
+      throw error;
+    }
+  }
+
+  private async _getQuote(
+    wallet: WalletRow,
+    skill: SkillDefinition<string>,
+    body: Record<string, unknown>,
+    userHash: string,
+    requestHash: string
+  ): Promise<{ quotedCostCents: number; isDevUnquoted: boolean }> {
+    try {
+      const checkResult = await this.agentcashClient.checkEndpoint(wallet, skill.endpoint, body);
+
+      if (checkResult.estimatedCostCents === undefined) {
+        throw new QuoteError("AgentCash did not return a bounded cost estimate.");
+      }
+
+      return { quotedCostCents: checkResult.estimatedCostCents, isDevUnquoted: false };
+    } catch (error) {
+      if (this.config.ALLOW_UNQUOTED_DEV_CALLS) {
+        this.logger.warn(
+          { skill: skill.name, userHash, requestHash },
+          "dev: ALLOW_UNQUOTED_DEV_CALLS proceeding without bounded quote"
+        );
+        return { quotedCostCents: 0, isDevUnquoted: true };
+      }
+
+      this.db.logPreflightAttempt({
+        userHash,
+        walletId: wallet.id,
+        skill: skill.name,
+        endpoint: skill.endpoint,
+        requestHash,
+        failureStage: "quote",
+        errorCode: error instanceof Error ? (error as { code?: string }).code ?? "QUOTE_FAILED" : "QUOTE_FAILED",
+        safeErrorMessage: "AgentCash quote/check failed"
+      });
+
+      throw new QuoteError(
+        "I couldn't safely quote this request, so I didn't run it. Please try again."
+      );
+    }
+  }
+
+  private async _runApprovedQuote(
+    quoteId: string,
+    wallet: WalletRow,
+    requestBody: Record<string, unknown>,
+    skill: SkillDefinition<string>,
+    userHash: string
+  ): Promise<{ type: "completed" } & SkillRenderResult> {
+    const quote = this.db.getQuote(quoteId)!;
 
     const transaction = this.db.createTransaction({
-      userId: user.id,
+      userId: wallet.owner_user_id!,
       walletId: wallet.id,
-      telegramChatId: context.telegramChatId,
-      telegramMessageId: context.telegramMessageId ?? null,
-      telegramIdHash,
+      telegramChatId: userHash,
+      telegramIdHash: userHash,
       commandName: skill.name,
       skill: skill.name,
       endpoint: skill.endpoint,
+      quoteId,
       status: "submitted",
-      estimatedCostCents: estimatedCostCents ?? null,
-      quotedPriceUsdc:
-        estimatedCostCents === undefined ? null : Number((estimatedCostCents / 100).toFixed(2)),
-      requestHash
+      estimatedCostCents: quote.quoted_cost_cents,
+      quotedPriceUsdc: Number((quote.quoted_cost_cents / 100).toFixed(6)),
+      requestHash: quote.request_hash
     }) as { id: string };
 
     try {
-      const fetchResult = await this.agentcashClient.fetchJson(wallet, skill.endpoint, body);
+      const fetchResult = await this.agentcashClient.fetchJson(wallet, skill.endpoint, requestBody);
       const responseHash = hashSensitiveValue(
         JSON.stringify(fetchResult.data),
         this.config.MASTER_ENCRYPTION_KEY
@@ -334,15 +502,22 @@ export class SkillExecutor {
         txHash: fetchResult.txHash ?? null
       });
 
+      this.db.updateQuoteStatus(quoteId, "executed", {
+        executedAt: new Date().toISOString(),
+        transactionId: transaction.id
+      });
+
       this.logger.info(
         {
           skill: skill.name,
           walletId: wallet.id,
-          telegramIdHash,
-          requestHash,
+          userHash,
+          quoteId,
+          requestHash: quote.request_hash,
           responseHash,
-          estimatedCostCents: estimatedCostCents ?? null,
+          quotedCostCents: quote.quoted_cost_cents,
           actualCostCents: fetchResult.actualCostCents ?? null,
+          isDevUnquoted: quote.is_dev_unquoted === 1,
           status: "success"
         },
         "skill execution completed"
@@ -351,7 +526,7 @@ export class SkillExecutor {
       return {
         type: "completed",
         ...rendered,
-        estimatedCostCents,
+        estimatedCostCents: quote.quoted_cost_cents,
         actualCostCents: fetchResult.actualCostCents
       };
     } catch (error) {
@@ -370,28 +545,61 @@ export class SkillExecutor {
         errorMessage: error instanceof Error ? error.message : "Unknown error"
       });
 
+      this.db.updateQuoteStatus(quoteId, "failed");
+
       this.logger.warn(
         {
           skill: skill.name,
           walletId: wallet.id,
-          telegramIdHash,
-          requestHash,
+          userHash,
+          quoteId,
+          requestHash: quote.request_hash,
           responseHash,
-          estimatedCostCents: estimatedCostCents ?? null,
+          quotedCostCents: quote.quoted_cost_cents,
           status: "error"
         },
         "skill execution failed"
       );
+
+      this.db.logPreflightAttempt({
+        userHash,
+        walletId: wallet.id,
+        skill: skill.name,
+        endpoint: skill.endpoint,
+        requestHash: quote.request_hash,
+        failureStage: "execution",
+        errorCode:
+          error instanceof Error && "code" in error
+            ? String((error as { code?: string }).code ?? "EXEC_ERROR")
+            : "EXEC_ERROR",
+        safeErrorMessage: "Skill execution failed after approval"
+      });
 
       throw error instanceof Error
         ? error
         : new AgentCashError("Skill execution failed", { cause: String(error) });
     }
   }
+}
 
-  decryptPendingInput(pending: PendingConfirmation): string {
-    return decryptSecret(pending.encryptedInput, this.config.MASTER_ENCRYPTION_KEY);
+/**
+ * Stable JSON canonicalization: sorts object keys recursively so the same
+ * logical request always produces the same byte string and therefore the
+ * same hash, regardless of insertion order.
+ */
+export function canonicalizeJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
   }
+
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalizeJson).join(",") + "]";
+  }
+
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  const pairs = keys.map(k => JSON.stringify(k) + ":" + canonicalizeJson(obj[k]));
+  return "{" + pairs.join(",") + "}";
 }
 
 function extractResultItems(data: unknown): Array<{ title: string; url: string; snippet?: string }> {
@@ -404,53 +612,36 @@ function extractResultItems(data: unknown): Array<{ title: string; url: string; 
   return array
     .map(item => {
       const object = firstObject(item);
-      if (!object) {
-        return null;
-      }
+      if (!object) return null;
 
       const title = pickFirstString(object, ["title", "name"]);
       const url = pickFirstString(object, ["url", "link"]);
       const snippet = pickFirstString(object, ["snippet", "text", "summary"]);
 
-      if (!title || !url) {
-        return null;
-      }
-
+      if (!title || !url) return null;
       return { title, url, snippet };
     })
     .filter(Boolean) as Array<{ title: string; url: string; snippet?: string }>;
 }
 
 function firstObject(value: unknown): Record<string, unknown> | null {
-  if (!value) {
-    return null;
-  }
-
+  if (!value) return null;
   if (Array.isArray(value)) {
     for (const item of value) {
       const found = firstObject(item);
-      if (found) {
-        return found;
-      }
+      if (found) return found;
     }
     return null;
   }
-
-  if (typeof value === "object") {
-    return value as Record<string, unknown>;
-  }
-
+  if (typeof value === "object") return value as Record<string, unknown>;
   return null;
 }
 
 function pickFirstString(object: Record<string, unknown>, keys: string[]): string | undefined {
   for (const key of keys) {
     const value = object[key];
-    if (typeof value === "string" && value.trim()) {
-      return value;
-    }
+    if (typeof value === "string" && value.trim()) return value;
   }
-
   return undefined;
 }
 

@@ -25,6 +25,10 @@ const envSchema = z
       .union([z.literal("true"), z.literal("false"), z.boolean()])
       .default("false")
       .transform(value => value === true || value === "true"),
+    ALLOW_UNQUOTED_DEV_CALLS: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
     PENDING_CONFIRMATION_TTL_SECONDS: z.coerce.number().int().positive().default(300),
     RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().int().positive().default(30),
     RATE_LIMIT_MAX_PER_HOUR: z.coerce.number().int().positive().default(100),

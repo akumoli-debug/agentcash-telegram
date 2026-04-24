@@ -1,53 +1,153 @@
-# Security Notes
+# Security Model
+
+This document describes the actual security posture honestly. It does not overclaim.
+
+**This is a quote-bound, spend-controlled MVP Telegram surface for AgentCash. It is designed to demonstrate safe payment UX and per-user wallet isolation. Hosted production would require deeper custody review, a managed KMS, and a production-grade database.**
+
+---
+
+## Payment integrity model
+
+Every paid call must satisfy all of the following before execution:
+
+1. AgentCash CLI returned a bounded cost estimate for the exact request.
+2. The user saw or implicitly accepted the quoted cost.
+3. The exact approved request (stored as canonical JSON) is the one executed — not re-parsed user input.
+4. The quote has not expired.
+5. The user's wallet balance covers the quoted cost.
+6. The call is within the user's confirmation cap and the hard MVP safety cap.
+7. The execution attempt is durably logged in `preflight_attempts`.
+
+If any of these are false, the call fails safely. The failure is logged in `preflight_attempts`.
+
+If `ALLOW_UNQUOTED_DEV_CALLS=true`, calls may proceed without a bounded quote — but are marked `dev_unquoted=1` in the `quotes` table and are never presented as production-safe.
+
+---
+
+## Quote record model
+
+Before any confirmation or execution, a `quotes` record is created with:
+
+- `user_hash` — keyed HMAC of the Telegram ID (not the raw ID)
+- `canonical_request_json` — stable JSON of the request body (sorted keys)
+- `request_hash` — HMAC of the canonical request
+- `quoted_cost_cents` — cost from AgentCash CLI check
+- `max_approved_cost_cents` — ceiling enforced at the DB layer
+- `status` — `pending → approved → executed` (or `expired / cancelled / failed`)
+- `expires_at` — immutable TTL set at creation
+
+Confirmation atomically transitions `pending → approved` via:
+
+```sql
+UPDATE quotes SET status='approved', approved_at=? WHERE id=? AND status='pending' AND expires_at > ?
+```
+
+If 0 rows are changed, the confirm is rejected (replay protection). Execution then transitions `approved → executed`. Both the per-user in-memory lock and the SQL check protect against concurrent double-execution.
+
+---
 
 ## Wallet isolation model
 
 - Each Telegram user gets a distinct AgentCash wallet context.
-- Wallet homes are isolated under `data/agentcash-homes/<telegram_id_hash>/`.
-- Folder names use a keyed hash, not the raw Telegram ID.
-- SQLite stores only wallet metadata needed for operation.
-- If private key material is captured from AgentCash CLI state, it is stored encrypted with AES-256-GCM using `MASTER_ENCRYPTION_KEY`.
+- Wallet home directories are named `<AGENTCASH_HOME_ROOT>/<user_hash>/` where `user_hash` is a keyed HMAC of the Telegram ID — never the raw Telegram ID.
+- SQLite stores wallet metadata. Private key material is encrypted at rest with AES-256-GCM using `MASTER_ENCRYPTION_KEY`.
+- Wallet provisioning is idempotent: if the wallet row exists and is active, the CLI is not called again.
+- If a new encrypted key is returned from the CLI but a different key already exists in the database, provisioning refuses with an error rather than silently overwriting.
+
+### AgentCash CLI dependency risk
+
+All CLI interactions are encapsulated in `agentcashClient.ts`. The CLI runs as a subprocess in the user's isolated home directory. This is the main operational risk:
+
+- If the CLI is unavailable, startup fails with a clear error.
+- CLI errors can surface in application error messages.
+- The CLI must be trusted — it receives the decrypted wallet private key via environment variable.
+- Key material is present in process memory only during CLI invocation.
+
+---
+
+## PII minimization
+
+Product, payment, and audit tables (`wallets`, `transactions`, `quotes`, `preflight_attempts`) contain:
+
+- `user_hash` — keyed HMAC-SHA256 of the Telegram user ID (24 hex chars)
+- No usernames, first names, or last names
+
+The only table that stores raw Telegram user IDs is `delivery_identities`, which maps `user_hash → telegram_user_id` for session/callback routing. This table is isolated from payment data.
+
+The `users` table stores `telegram_user_id` for session lookup but no personal name fields.
+
+`telegram_chat_id` in `transactions` rows stores the hashed chat ID, not the raw value.
+
+---
+
+## Preflight failure logging
+
+Failed attempts are recorded in `preflight_attempts` with:
+
+- `user_hash`
+- `wallet_id` if available
+- `skill`
+- `failure_stage`: `wallet | balance | quote | cap | execution | replay | expired`
+- `error_code`
+- `safe_error_message`
+
+No raw request bodies or user input is logged.
+
+---
 
 ## Logging model
 
-- The bot does not intentionally log raw private keys, raw signed payloads, or raw AgentCash API responses.
-- Transaction logging stores request and response hashes, not raw bodies.
-- Telegram identifiers are hashed before application logging.
-- Logger redaction covers common secret-bearing fields including private keys, API keys, webhook secrets, encrypted pending inputs, and raw payload fields.
+- No raw private keys, signed payloads, or raw API responses are logged.
+- Transaction logging stores request and response hashes only.
+- Telegram identifiers are hashed before logging.
+- Pino redaction covers: private keys, encrypted inputs, session state JSON, API keys, webhook secrets, raw CLI output fields.
 
-## Spending cap model
+---
 
-- Default per-call confirmation cap is `$0.50`.
-- Hard MVP cap is `$5.00` unless `ALLOW_HIGH_VALUE_CALLS=true`.
-- Slash commands and natural-language routed calls both go through `skillExecutor`.
-- Natural-language routed calls always require confirmation before any paid call.
-- Pending confirmations expire after 5 minutes and are consumed atomically to reduce replay risk.
+## Spending caps
+
+- Default per-call confirmation cap: `$0.50` (configurable via `/cap`)
+- Hard MVP ceiling: `$5.00` unless `ALLOW_HIGH_VALUE_CALLS=true`
+- Natural-language routed calls always require explicit confirmation regardless of cap.
+- Cap denials are logged in `preflight_attempts`.
+
+---
 
 ## Rate limiting
 
-- Per Telegram user limit is enforced in SQLite-backed middleware.
-- Limits default to `30` requests per minute and `100` requests per hour.
-- The limiter is checked before command execution.
+- Per Telegram user, enforced in SQLite-backed middleware: 30/minute and 100/hour (configurable).
+- Process-local; not distributed across multiple replicas.
 
-## Webhook and polling modes
+---
 
-- Polling mode is the default for local demos.
-- Webhook mode is supported with `BOT_MODE=webhook`.
-- When webhook mode is used, the bot can set a Telegram webhook secret token via `WEBHOOK_SECRET_TOKEN`.
+## Replay and concurrency protection
 
-## Known limitations
+- Per-user in-memory lock (`withUserLock`) serializes wallet provisioning and confirmation/execution per user.
+- SQL-level atomic approve prevents double-execution even under concurrent callbacks.
+- Session state stores only `quote_id`, not raw input. Confirm handler verifies the quote ID matches the session before proceeding.
 
-- SQLite is acceptable for local demos but is not ideal for horizontally scaled production deployments.
-- Wallet secrets are encrypted at rest, but the process still decrypts them in memory when invoking AgentCash.
-- Rate limiting is process-shared through SQLite on one instance, not globally distributed across multiple replicas.
-- Router traffic to OpenAI or Anthropic is optional, but enabling it sends non-slash user text to that provider.
-- AgentCash CLI stderr/stdout is kept out of normal logs, but upstream tooling behavior can still influence error messages.
+---
+
+## Known limitations and honest caveats
+
+| Risk | Current state |
+|---|---|
+| SQLite | Local only. Not suitable for distributed production. |
+| In-memory lock | Per-process only. Multiple replicas = no cross-process locking. |
+| CLI subprocess trust | The CLI is trusted. It receives the decrypted private key. |
+| Key material in memory | Decrypted during CLI invocations. Not zeroed after use. |
+| `MASTER_ENCRYPTION_KEY` rotation | No rotation procedure exists. |
+| AgentCash CLI availability | If the CLI is broken or unavailable, no paid calls can proceed. |
+| Router traffic | If NL routing is enabled, non-slash user text is sent to OpenAI or Anthropic. |
+
+---
 
 ## Before hosted production
 
-- Move secret management to a managed KMS or HSM-backed service.
-- Replace SQLite with a production database and a distributed rate limiter.
-- Put webhook mode behind HTTPS with a fixed domain and set `WEBHOOK_SECRET_TOKEN`.
-- Add structured audit logging and alerting around repeated payment failures and rate-limit abuse.
-- Add stronger outbound network controls and sandboxing around the AgentCash CLI process.
-- Add secret rotation procedures for the bot token, router API keys, and master encryption key.
+- Move key management to a managed KMS or HSM-backed service.
+- Replace SQLite with a production database and distributed lock (e.g., Redis).
+- Use webhook mode with HTTPS and `WEBHOOK_SECRET_TOKEN`.
+- Add structured audit log shipping and alerting for repeated payment failures.
+- Add sandboxing around the AgentCash CLI process (e.g., seccomp, network restrictions).
+- Implement key rotation procedures for bot token, API keys, and master encryption key.
+- Review custody model — this MVP assumes the operator can access all wallet keys.
