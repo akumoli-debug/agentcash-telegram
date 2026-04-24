@@ -1,0 +1,265 @@
+import { Telegraf } from "telegraf";
+import type { AppConfig } from "./config.js";
+import type { AppLogger } from "./lib/logger.js";
+import { AppDatabase } from "./db/client.js";
+import { WalletManager } from "./wallets/walletManager.js";
+import { SkillExecutor } from "./agentcash/skillExecutor.js";
+import { hashSensitiveValue, hashTelegramId } from "./lib/crypto.js";
+import { createStartCommand } from "./commands/start.js";
+import { createBalanceCommand } from "./commands/balance.js";
+import { createDepositCommand } from "./commands/deposit.js";
+import { createHelpCommand } from "./commands/help.js";
+import { createResearchCommand } from "./commands/research.js";
+import { createEnrichCommand } from "./commands/enrich.js";
+import { createGenerateCommand } from "./commands/generate.js";
+import { createCapCommand } from "./commands/cap.js";
+import { executeSkillRequest } from "./commands/skillCommand.js";
+import {
+  assertPrivateChatContext,
+  ensureUserRecord,
+  confirmationKeyboard,
+  getCallbackData,
+  isPendingConfirmationExpired,
+  parsePendingConfirmation,
+  replyWithSkillResult
+} from "./commands/helpers.js";
+import { replyWithError } from "./commands/replyWithError.js";
+import { RouterClient, extractSkillInput } from "./router/routerClient.js";
+
+export function createBot(deps: {
+  config: AppConfig;
+  logger: AppLogger;
+  db: AppDatabase;
+  walletManager: WalletManager;
+  skillExecutor: SkillExecutor;
+  routerClient: RouterClient;
+}) {
+  const bot = new Telegraf(deps.config.TELEGRAM_BOT_TOKEN);
+
+  bot.use(async (ctx, next) => {
+    const telegramIdHash = ctx.from?.id
+      ? hashTelegramId(String(ctx.from.id), deps.config.MASTER_ENCRYPTION_KEY)
+      : undefined;
+    const chatIdHash = ctx.chat?.id
+      ? hashSensitiveValue(`chat:${String(ctx.chat.id)}`, deps.config.MASTER_ENCRYPTION_KEY).slice(0, 24)
+      : undefined;
+
+    deps.logger.info(
+      {
+        updateType: ctx.updateType,
+        chatIdHash,
+        telegramIdHash
+      },
+      "incoming Telegram update"
+    );
+    await next();
+  });
+
+  bot.use(async (ctx, next) => {
+    if (!ctx.from) {
+      await next();
+      return;
+    }
+
+    const user = ensureUserRecord(deps.db, ctx, deps.config.DEFAULT_SPEND_CAP_USDC);
+    const result = deps.db.checkAndRecordRateLimit(user.id, {
+      eventName: ctx.updateType,
+      maxPerMinute: deps.config.RATE_LIMIT_MAX_PER_MINUTE,
+      maxPerHour: deps.config.RATE_LIMIT_MAX_PER_HOUR
+    });
+
+    if (result.allowed) {
+      await next();
+      return;
+    }
+
+    deps.logger.warn(
+      {
+        telegramIdHash: hashTelegramId(String(ctx.from.id), deps.config.MASTER_ENCRYPTION_KEY),
+        minuteCount: result.minuteCount,
+        hourCount: result.hourCount,
+        updateType: ctx.updateType
+      },
+      "telegram rate limit exceeded"
+    );
+
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery("Rate limit reached. Please try again shortly.");
+      return;
+    }
+
+    await ctx.reply("Rate limit reached. Please wait a bit and try again.");
+  });
+
+  bot.command("start", createStartCommand(deps));
+  bot.command("help", createHelpCommand());
+  bot.command("balance", createBalanceCommand(deps));
+  bot.command("deposit", createDepositCommand(deps));
+  bot.command("cap", createCapCommand(deps));
+  bot.command("research", createResearchCommand(deps));
+  bot.command("enrich", createEnrichCommand(deps));
+  bot.command("generate", createGenerateCommand(deps));
+  bot.on("text", async ctx => {
+    const text = ctx.message.text.trim();
+
+    if (!text || text.startsWith("/")) {
+      return;
+    }
+
+    try {
+      const decision = await deps.routerClient.routeMessage(text);
+
+      if (!decision) {
+        await ctx.reply(
+          "Natural language routing is not configured. Use /research, /enrich, or /generate."
+        );
+        return;
+      }
+
+      if (
+        decision.skill === "none" ||
+        decision.confidence < deps.config.ROUTER_CONFIDENCE_THRESHOLD
+      ) {
+        await ctx.reply(
+          "I’m not confident enough to route that safely. Use /research <query>, /enrich <email>, or /generate <prompt>."
+        );
+        return;
+      }
+
+      const rawInput = extractSkillInput(decision);
+
+      if (!rawInput) {
+        await ctx.reply(
+          "I could not extract safe arguments from that message. Please use a slash command."
+        );
+        return;
+      }
+
+      await executeSkillRequest(
+        ctx,
+        {
+          config: deps.config,
+          db: deps.db,
+          skillExecutor: deps.skillExecutor,
+          skillName: decision.skill
+        },
+        rawInput,
+        { forceConfirmation: true }
+      );
+    } catch (error) {
+      await replyWithError(ctx, error);
+    }
+  });
+  bot.action(/^confirm:/, async ctx => {
+    try {
+      const data = getCallbackData(ctx);
+      const token = data.slice("confirm:".length);
+      const { telegramId, chatId } = assertPrivateChatContext(ctx);
+      const user = deps.walletManager.getExistingUser(telegramId);
+      const session = deps.db.getSession(user.id, chatId);
+      const pending = parsePendingConfirmation(session);
+
+      if (!pending || pending.token !== token) {
+        await ctx.answerCbQuery("This confirmation is no longer valid.");
+        return;
+      }
+
+      if (isPendingConfirmationExpired(pending)) {
+        deps.db.clearSessionState(user.id, chatId);
+        await ctx.answerCbQuery("This confirmation expired.");
+        await ctx.reply("That pending confirmation expired. Please rerun the command.");
+        return;
+      }
+
+      const stateJson = session?.state_json ?? "";
+      const consumed = deps.db.consumeSessionState(user.id, chatId, stateJson);
+      if (!consumed) {
+        await ctx.answerCbQuery("This confirmation was already used.");
+        return;
+      }
+
+      await ctx.answerCbQuery("Confirmed.");
+
+      const result = await deps.skillExecutor.execute(
+        pending.skill,
+        deps.skillExecutor.decryptPendingInput(pending),
+        {
+          telegramId,
+          telegramProfile: {
+            username: ctx.from?.username ?? null,
+            firstName: ctx.from?.first_name ?? null,
+            lastName: ctx.from?.last_name ?? null
+          },
+          telegramChatId: chatId,
+          telegramMessageId:
+            ctx.callbackQuery && "message" in ctx.callbackQuery && ctx.callbackQuery.message
+              ? String(ctx.callbackQuery.message.message_id)
+              : null,
+          confirmed: true
+        }
+      );
+
+      if (result.type === "confirmation_required") {
+        deps.db.upsertSession({
+          userId: user.id,
+          telegramChatId: chatId,
+          currentCommand: pending.skill,
+          stateJson: JSON.stringify(result.pending)
+        });
+
+        await ctx.reply(result.text, confirmationKeyboard(result.pending.token));
+        return;
+      }
+
+      await replyWithSkillResult(ctx, result);
+    } catch (error) {
+      await replyWithError(ctx, error);
+    }
+  });
+  bot.action(/^cancel:/, async ctx => {
+    try {
+      const data = getCallbackData(ctx);
+      const token = data.slice("cancel:".length);
+      const { telegramId, chatId } = assertPrivateChatContext(ctx);
+      const user = deps.walletManager.getExistingUser(telegramId);
+      const session = deps.db.getSession(user.id, chatId);
+      const pending = parsePendingConfirmation(session);
+
+      if (!pending || pending.token !== token) {
+        await ctx.answerCbQuery("This confirmation is no longer valid.");
+        return;
+      }
+
+      const stateJson = session?.state_json ?? "";
+      const consumed = deps.db.consumeSessionState(user.id, chatId, stateJson);
+      if (!consumed) {
+        await ctx.answerCbQuery("This confirmation was already used.");
+        return;
+      }
+
+      await ctx.answerCbQuery("Cancelled.");
+      await ctx.reply("Pending call cancelled.");
+    } catch (error) {
+      await replyWithError(ctx, error);
+    }
+  });
+
+  bot.catch(async (error, ctx) => {
+    deps.logger.error(
+      {
+        err: error instanceof Error ? { name: error.name, message: error.message } : { message: String(error) },
+        chatIdHash: ctx.chat?.id
+          ? hashSensitiveValue(`chat:${String(ctx.chat.id)}`, deps.config.MASTER_ENCRYPTION_KEY).slice(0, 24)
+          : undefined,
+        telegramIdHash: ctx.from?.id
+          ? hashTelegramId(String(ctx.from.id), deps.config.MASTER_ENCRYPTION_KEY)
+          : undefined
+      },
+      "bot handler failed"
+    );
+
+    await ctx.reply("Something went wrong while handling that command.");
+  });
+
+  return bot;
+}
