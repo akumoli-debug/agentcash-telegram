@@ -1,0 +1,35 @@
+services:
+  agentcash-bot:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_PATH: /app/.data/agentcash-telegram.db
+      AGENTCASH_HOME_ROOT: /app/data/agentcash-homes
+      HEALTH_HOST: 0.0.0.0
+      HEALTH_PORT: 3001
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    volumes:
+      - agentcash-data:/app/.data
+      - agentcash-homes:/app/data/agentcash-homes
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  agentcash-data:
+  agentcash-homes:

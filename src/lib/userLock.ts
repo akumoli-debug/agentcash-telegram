@@ -1,20 +1,7 @@
-const pending = new Map<string, Promise<void>>();
+import { defaultLockManager } from "./lockManager.js";
+
+const DEFAULT_USER_LOCK_TTL_MS = 120_000;
 
 export async function withUserLock<T>(userHash: string, fn: () => Promise<T>): Promise<T> {
-  const prev = pending.get(userHash) ?? Promise.resolve();
-  let release!: () => void;
-  const curr = new Promise<void>(r => {
-    release = r;
-  });
-  pending.set(userHash, curr);
-
-  try {
-    await prev;
-    return await fn();
-  } finally {
-    release();
-    if (pending.get(userHash) === curr) {
-      pending.delete(userHash);
-    }
-  }
+  return defaultLockManager.withLock(userHash, DEFAULT_USER_LOCK_TTL_MS, fn);
 }

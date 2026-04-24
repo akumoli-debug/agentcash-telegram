@@ -31,6 +31,27 @@ export interface WalletRow {
   updated_at: string;
 }
 
+export interface GroupRow {
+  id: string;
+  telegram_chat_id_hash: string;
+  title_hash: string | null;
+  wallet_id: string;
+  created_by_user_id: string;
+  cap_enabled: number;
+  spend_cap_usdc: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GroupMemberRow {
+  id: string;
+  group_id: string;
+  user_id: string;
+  role: "owner" | "admin" | "member";
+  created_at: string;
+  updated_at: string;
+}
+
 export interface QuoteRow {
   id: string;
   user_hash: string;
@@ -48,6 +69,9 @@ export interface QuoteRow {
   approved_at: string | null;
   executed_at: string | null;
   transaction_id: string | null;
+  requester_user_id: string | null;
+  group_id: string | null;
+  requires_group_admin_approval: number;
 }
 
 export interface QuoteInput {
@@ -61,6 +85,9 @@ export interface QuoteInput {
   maxApprovedCostCents: number;
   isDevUnquoted: boolean;
   expiresAt: string;
+  requesterUserId?: string | null;
+  groupId?: string | null;
+  requiresGroupAdminApproval?: boolean;
 }
 
 export interface PreflightAttemptInput {
@@ -98,6 +125,7 @@ export interface TransactionInput {
   telegramChatId: string;
   telegramMessageId?: string | null;
   telegramIdHash?: string | null;
+  groupId?: string | null;
   commandName: string;
   skill?: string | null;
   origin?: string | null;
@@ -126,6 +154,41 @@ export interface HistoryEntry {
   created_at: string;
   error_code: string | null;
   is_dev_unquoted: number | null;
+}
+
+export interface GroupMemberSummary {
+  role: GroupMemberRow["role"];
+  count: number;
+}
+
+export interface InlinePayloadRow {
+  id: string;
+  token_hash: string;
+  payload_json: string;
+  signature: string;
+  created_at: string;
+  expires_at: string;
+  consumed_at: string | null;
+}
+
+export type AuditEventName =
+  | "wallet.created"
+  | "quote.created"
+  | "quote.approved"
+  | "quote.rejected"
+  | "quote.expired"
+  | "paid_call.submitted"
+  | "paid_call.failed";
+
+export interface AuditEventInput {
+  eventName: AuditEventName;
+  walletId?: string | null;
+  quoteId?: string | null;
+  transactionId?: string | null;
+  actorHash?: string | null;
+  groupId?: string | null;
+  status?: string | null;
+  metadata?: Record<string, string | number | boolean | null>;
 }
 
 function nowIso() {
@@ -165,6 +228,84 @@ export class AppDatabase {
     this.ensureTransactionColumn("request_hash", "TEXT");
     this.ensureTransactionColumn("response_hash", "TEXT");
     this.ensureTransactionColumn("quote_id", "TEXT");
+    this.ensureTransactionColumn("group_id", "TEXT");
+    this.ensureQuoteColumn("requester_user_id", "TEXT");
+    this.ensureQuoteColumn("group_id", "TEXT");
+    this.ensureQuoteColumn("requires_group_admin_approval", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureGroupColumn("cap_enabled", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureGroupColumn("spend_cap_usdc", "REAL NOT NULL DEFAULT 0.5");
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS groups (
+        id TEXT PRIMARY KEY,
+        telegram_chat_id_hash TEXT NOT NULL UNIQUE,
+        title_hash TEXT,
+        wallet_id TEXT NOT NULL UNIQUE,
+        created_by_user_id TEXT NOT NULL,
+        cap_enabled INTEGER NOT NULL DEFAULT 1,
+        spend_cap_usdc REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (created_by_user_id) REFERENCES users(id)
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS group_members (
+        id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (group_id) REFERENCES groups(id),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        UNIQUE(group_id, user_id)
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS group_members_group_role_idx
+      ON group_members(group_id, role)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS transactions_group_created_at_idx
+      ON transactions(group_id, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS audit_events (
+        id TEXT PRIMARY KEY,
+        event_name TEXT NOT NULL,
+        wallet_id TEXT,
+        quote_id TEXT,
+        transaction_id TEXT,
+        actor_hash TEXT,
+        group_id TEXT,
+        status TEXT,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS audit_events_name_created_at_idx
+      ON audit_events(event_name, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS audit_events_quote_idx
+      ON audit_events(quote_id, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS inline_payloads (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS inline_payloads_expires_at_idx
+      ON inline_payloads(expires_at)
+    `);
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS request_events (
         id TEXT PRIMARY KEY,
@@ -319,6 +460,12 @@ export class AppDatabase {
     return this.sqlite.prepare("SELECT * FROM wallets WHERE id = ?").get(id) as WalletRow | undefined;
   }
 
+  getWalletByGroupId(groupId: string): WalletRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM wallets WHERE owner_group_id = ? AND kind = 'group' LIMIT 1")
+      .get(groupId) as WalletRow | undefined;
+  }
+
   createUserWallet(
     userId: string,
     input: {
@@ -354,7 +501,171 @@ export class AppDatabase {
         timestamp
       );
 
+    this.createAuditEvent({
+      eventName: "wallet.created",
+      walletId: id,
+      status: input.status ?? "pending",
+      metadata: { kind: "user" }
+    });
+
     return this.sqlite.prepare("SELECT * FROM wallets WHERE id = ?").get(id) as WalletRow;
+  }
+
+  getGroupByTelegramChatHash(telegramChatIdHash: string): GroupRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM groups WHERE telegram_chat_id_hash = ?")
+      .get(telegramChatIdHash) as GroupRow | undefined;
+  }
+
+  getGroupById(groupId: string): GroupRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as GroupRow | undefined;
+  }
+
+  createGroupWithWallet(input: {
+    telegramChatIdHash: string;
+    titleHash?: string | null;
+    createdByUserId: string;
+    spendCapUsdc: number;
+    homeDirHash: string;
+  }): { group: GroupRow; wallet: WalletRow; member: GroupMemberRow } {
+    const create = this.sqlite.transaction(() => {
+      const timestamp = nowIso();
+      const groupId = makeId("grp");
+      const walletId = makeId("wal");
+      const memberId = makeId("gmb");
+
+      this.sqlite
+        .prepare(
+          `
+            INSERT INTO groups (
+              id, telegram_chat_id_hash, title_hash, wallet_id, created_by_user_id,
+              cap_enabled, spend_cap_usdc, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+          `
+        )
+        .run(
+          groupId,
+          input.telegramChatIdHash,
+          input.titleHash ?? null,
+          walletId,
+          input.createdByUserId,
+          input.spendCapUsdc,
+          timestamp,
+          timestamp
+        );
+
+      this.sqlite
+        .prepare(
+          `
+            INSERT INTO wallets (
+              id, kind, owner_user_id, owner_group_id, home_dir_hash, address, network,
+              deposit_link, encrypted_private_key, status, created_at, updated_at
+            ) VALUES (?, 'group', NULL, ?, ?, NULL, NULL, NULL, NULL, 'pending', ?, ?)
+          `
+        )
+        .run(walletId, groupId, input.homeDirHash, timestamp, timestamp);
+
+      this.sqlite
+        .prepare(
+          `
+            INSERT INTO group_members (id, group_id, user_id, role, created_at, updated_at)
+            VALUES (?, ?, ?, 'owner', ?, ?)
+          `
+        )
+        .run(memberId, groupId, input.createdByUserId, timestamp, timestamp);
+
+      this.createAuditEvent({
+        eventName: "wallet.created",
+        walletId,
+        groupId,
+        status: "pending",
+        metadata: { kind: "group" }
+      });
+
+      return {
+        group: this.getGroupById(groupId)!,
+        wallet: this.getWalletById(walletId)!,
+        member: this.getGroupMember(groupId, input.createdByUserId)!
+      };
+    });
+
+    return create();
+  }
+
+  ensureGroupMember(
+    groupId: string,
+    userId: string,
+    role: GroupMemberRow["role"] = "member"
+  ): GroupMemberRow {
+    const existing = this.getGroupMember(groupId, userId);
+    const timestamp = nowIso();
+
+    if (existing) {
+      this.sqlite
+        .prepare("UPDATE group_members SET updated_at = ? WHERE id = ?")
+        .run(timestamp, existing.id);
+      return this.getGroupMember(groupId, userId)!;
+    }
+
+    const id = makeId("gmb");
+    this.sqlite
+      .prepare(
+        `
+          INSERT INTO group_members (id, group_id, user_id, role, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `
+      )
+      .run(id, groupId, userId, role, timestamp, timestamp);
+
+    return this.getGroupMember(groupId, userId)!;
+  }
+
+  getGroupMember(groupId: string, userId: string): GroupMemberRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM group_members WHERE group_id = ? AND user_id = ?")
+      .get(groupId, userId) as GroupMemberRow | undefined;
+  }
+
+  getGroupMemberSummaries(groupId: string): GroupMemberSummary[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT role, COUNT(*) AS count
+          FROM group_members
+          WHERE group_id = ?
+          GROUP BY role
+          ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+        `
+      )
+      .all(groupId) as GroupMemberSummary[];
+  }
+
+  updateGroupCap(
+    groupId: string,
+    input: { amount?: number; enabled?: boolean }
+  ): GroupRow {
+    const current = this.getGroupById(groupId);
+
+    if (!current) {
+      throw new Error(`Group ${groupId} not found`);
+    }
+
+    this.sqlite
+      .prepare(
+        `
+          UPDATE groups
+          SET cap_enabled = ?, spend_cap_usdc = ?, updated_at = ?
+          WHERE id = ?
+        `
+      )
+      .run(
+        input.enabled === undefined ? current.cap_enabled : input.enabled ? 1 : 0,
+        input.amount ?? current.spend_cap_usdc,
+        nowIso(),
+        groupId
+      );
+
+    return this.getGroupById(groupId)!;
   }
 
   updateWallet(
@@ -406,8 +717,9 @@ export class AppDatabase {
           INSERT INTO quotes (
             id, user_hash, wallet_id, skill, endpoint, canonical_request_json, request_hash,
             quoted_cost_cents, max_approved_cost_cents, is_dev_unquoted, status,
-            created_at, expires_at, approved_at, executed_at, transaction_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL)
+            created_at, expires_at, approved_at, executed_at, transaction_id,
+            requester_user_id, group_id, requires_group_admin_approval
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?)
         `
       )
       .run(
@@ -422,8 +734,25 @@ export class AppDatabase {
         input.maxApprovedCostCents,
         input.isDevUnquoted ? 1 : 0,
         timestamp,
-        input.expiresAt
+        input.expiresAt,
+        input.requesterUserId ?? null,
+        input.groupId ?? null,
+        input.requiresGroupAdminApproval ? 1 : 0
       );
+
+    this.createAuditEvent({
+      eventName: "quote.created",
+      walletId: input.walletId,
+      quoteId: id,
+      actorHash: input.userHash,
+      groupId: input.groupId ?? null,
+      status: "pending",
+      metadata: {
+        skill: input.skill,
+        quotedCostCents: input.quotedCostCents,
+        isDevUnquoted: input.isDevUnquoted
+      }
+    });
 
     return this.sqlite.prepare("SELECT * FROM quotes WHERE id = ?").get(id) as QuoteRow;
   }
@@ -447,6 +776,18 @@ export class AppDatabase {
       )
       .run(nowIso(), id, nowIso()) as { changes: number };
 
+    if (result.changes > 0) {
+      const quote = this.getQuote(id);
+      this.createAuditEvent({
+        eventName: "quote.approved",
+        walletId: quote?.wallet_id ?? null,
+        quoteId: id,
+        actorHash: quote?.user_hash ?? null,
+        groupId: quote?.group_id ?? null,
+        status: "approved"
+      });
+    }
+
     return result.changes > 0;
   }
 
@@ -464,6 +805,19 @@ export class AppDatabase {
         `
       )
       .run(status, extras?.executedAt ?? null, extras?.transactionId ?? null, id);
+
+    if (status === "expired" || status === "cancelled" || status === "failed") {
+      const quote = this.getQuote(id);
+      this.createAuditEvent({
+        eventName: status === "expired" ? "quote.expired" : "quote.rejected",
+        walletId: quote?.wallet_id ?? null,
+        quoteId: id,
+        transactionId: extras?.transactionId ?? quote?.transaction_id ?? null,
+        actorHash: quote?.user_hash ?? null,
+        groupId: quote?.group_id ?? null,
+        status
+      });
+    }
   }
 
   logPreflightAttempt(input: PreflightAttemptInput): void {
@@ -661,10 +1015,10 @@ export class AppDatabase {
       .prepare(
         `
           INSERT INTO transactions (
-            id, user_id, wallet_id, session_id, telegram_chat_id, telegram_message_id, telegram_id_hash, command_name,
+            id, user_id, wallet_id, session_id, telegram_chat_id, telegram_message_id, telegram_id_hash, group_id, command_name,
             skill, origin, endpoint, quote_id, status, quoted_price_usdc, actual_price_usdc, estimated_cost_cents, actual_cost_cents, tx_hash,
             request_hash, response_hash, request_summary, response_summary, error_code, error_message, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `
       )
       .run(
@@ -675,6 +1029,7 @@ export class AppDatabase {
         input.telegramChatId,
         input.telegramMessageId ?? null,
         input.telegramIdHash ?? null,
+        input.groupId ?? null,
         input.commandName,
         input.skill ?? null,
         input.origin ?? null,
@@ -696,6 +1051,23 @@ export class AppDatabase {
         timestamp
       );
 
+    if (input.status === "submitted") {
+      this.createAuditEvent({
+        eventName: "paid_call.submitted",
+        walletId: input.walletId ?? null,
+        quoteId: input.quoteId ?? null,
+        transactionId: id,
+        actorHash: input.telegramIdHash ?? null,
+        groupId: input.groupId ?? null,
+        status: input.status,
+        metadata: {
+          commandName: input.commandName,
+          skill: input.skill ?? null,
+          estimatedCostCents: input.estimatedCostCents ?? null
+        }
+      });
+    }
+
     return this.sqlite.prepare("SELECT * FROM transactions WHERE id = ?").get(id);
   }
 
@@ -715,7 +1087,7 @@ export class AppDatabase {
       .prepare(
         `
           UPDATE transactions
-          SET wallet_id = ?, session_id = ?, telegram_chat_id = ?, telegram_message_id = ?, telegram_id_hash = ?,
+          SET wallet_id = ?, session_id = ?, telegram_chat_id = ?, telegram_message_id = ?, telegram_id_hash = ?, group_id = ?,
               command_name = ?, skill = ?, origin = ?, endpoint = ?, quote_id = ?, status = ?, quoted_price_usdc = ?,
               actual_price_usdc = ?, estimated_cost_cents = ?, actual_cost_cents = ?, tx_hash = ?,
               request_hash = ?, response_hash = ?, request_summary = ?, response_summary = ?, error_code = ?,
@@ -729,6 +1101,7 @@ export class AppDatabase {
         input.telegramChatId ?? current.telegram_chat_id ?? null,
         input.telegramMessageId ?? current.telegram_message_id ?? null,
         input.telegramIdHash ?? current.telegram_id_hash ?? null,
+        input.groupId ?? current.group_id ?? null,
         input.commandName ?? current.command_name ?? null,
         input.skill ?? current.skill ?? null,
         input.origin ?? current.origin ?? null,
@@ -749,6 +1122,21 @@ export class AppDatabase {
         nowIso(),
         id
       );
+
+    if (input.status === "error") {
+      this.createAuditEvent({
+        eventName: "paid_call.failed",
+        walletId: String(input.walletId ?? current.wallet_id ?? ""),
+        quoteId: String(input.quoteId ?? current.quote_id ?? ""),
+        transactionId: id,
+        actorHash: String(input.telegramIdHash ?? current.telegram_id_hash ?? ""),
+        groupId: input.groupId === undefined ? (current.group_id as string | null) : input.groupId ?? null,
+        status: "error",
+        metadata: {
+          errorCode: input.errorCode ?? null
+        }
+      });
+    }
 
     return this.sqlite.prepare("SELECT * FROM transactions WHERE id = ?").get(id);
   }
@@ -774,6 +1162,95 @@ export class AppDatabase {
         `
       )
       .all(telegramIdHash, limit) as HistoryEntry[];
+  }
+
+  getHistoryForGroup(groupId: string, limit = 10): HistoryEntry[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT
+            t.id,
+            t.skill,
+            t.status,
+            t.quoted_price_usdc,
+            t.actual_cost_cents,
+            t.created_at,
+            t.error_code,
+            q.is_dev_unquoted
+          FROM transactions t
+          LEFT JOIN quotes q ON t.quote_id = q.id
+          WHERE t.group_id = ?
+          ORDER BY t.created_at DESC
+          LIMIT ?
+        `
+      )
+      .all(groupId, limit) as HistoryEntry[];
+  }
+
+  createInlinePayload(input: {
+    id: string;
+    tokenHash: string;
+    payloadJson: string;
+    signature: string;
+    expiresAt: string;
+  }): InlinePayloadRow {
+    const timestamp = nowIso();
+
+    this.sqlite
+      .prepare(
+        `
+          INSERT INTO inline_payloads (
+            id, token_hash, payload_json, signature, created_at, expires_at, consumed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+        `
+      )
+      .run(input.id, input.tokenHash, input.payloadJson, input.signature, timestamp, input.expiresAt);
+
+    return this.getInlinePayload(input.id)!;
+  }
+
+  getInlinePayload(id: string): InlinePayloadRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM inline_payloads WHERE id = ?")
+      .get(id) as InlinePayloadRow | undefined;
+  }
+
+  consumeInlinePayload(id: string, tokenHash: string, now: string): boolean {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE inline_payloads
+          SET consumed_at = ?
+          WHERE id = ? AND token_hash = ? AND consumed_at IS NULL AND expires_at > ?
+        `
+      )
+      .run(now, id, tokenHash, now) as { changes: number };
+
+    return result.changes > 0;
+  }
+
+  createAuditEvent(input: AuditEventInput): void {
+    this.sqlite
+      .prepare(
+        `
+          INSERT INTO audit_events (
+            id, event_name, wallet_id, quote_id, transaction_id, actor_hash,
+            group_id, status, metadata_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      )
+      .run(
+        makeId("aud"),
+        input.eventName,
+        input.walletId || null,
+        input.quoteId || null,
+        input.transactionId || null,
+        input.actorHash || null,
+        input.groupId || null,
+        input.status || null,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+        nowIso()
+      );
   }
 
   private ensureWalletColumn(name: string, type: string) {
@@ -804,5 +1281,25 @@ export class AppDatabase {
     }
 
     this.sqlite.exec(`ALTER TABLE transactions ADD COLUMN ${name} ${type}`);
+  }
+
+  private ensureQuoteColumn(name: string, type: string) {
+    const columns = this.sqlite.prepare("PRAGMA table_info(quotes)").all() as Array<{ name: string }>;
+
+    if (columns.some(column => column.name === name)) {
+      return;
+    }
+
+    this.sqlite.exec(`ALTER TABLE quotes ADD COLUMN ${name} ${type}`);
+  }
+
+  private ensureGroupColumn(name: string, type: string) {
+    const columns = this.sqlite.prepare("PRAGMA table_info(groups)").all() as Array<{ name: string }>;
+
+    if (columns.some(column => column.name === name)) {
+      return;
+    }
+
+    this.sqlite.exec(`ALTER TABLE groups ADD COLUMN ${name} ${type}`);
   }
 }

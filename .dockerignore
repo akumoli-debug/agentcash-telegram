@@ -1,0 +1,13 @@
+.git
+.data
+data
+node_modules
+coverage
+dist
+.env
+.env.*
+!.env.example
+npm-debug.log
+pnpm-debug.log
+Dockerfile
+docker-compose.yml

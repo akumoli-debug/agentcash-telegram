@@ -14,6 +14,8 @@ import { createEnrichCommand } from "./commands/enrich.js";
 import { createGenerateCommand } from "./commands/generate.js";
 import { createCapCommand } from "./commands/cap.js";
 import { createHistoryCommand } from "./commands/history.js";
+import { createGroupWalletCommand } from "./commands/groupWallet.js";
+import { createInlineQueryHandler } from "./commands/inlineMode.js";
 import { executeSkillRequest } from "./commands/skillCommand.js";
 import {
   assertPrivateChatContext,
@@ -35,6 +37,10 @@ export function createBot(deps: {
   skillExecutor: SkillExecutor;
   routerClient: RouterClient;
 }) {
+  if (!deps.config.TELEGRAM_BOT_TOKEN) {
+    throw new Error("TELEGRAM_BOT_TOKEN is required to start the Telegram bot");
+  }
+
   const bot = new Telegraf(deps.config.TELEGRAM_BOT_TOKEN);
 
   bot.use(async (ctx, next) => {
@@ -103,6 +109,9 @@ export function createBot(deps: {
   bot.command("enrich", createEnrichCommand(deps));
   bot.command("generate", createGenerateCommand(deps));
   bot.command("history", createHistoryCommand(deps));
+  bot.command("groupwallet", createGroupWalletCommand(deps));
+
+  bot.on("inline_query", createInlineQueryHandler(deps));
 
   bot.on("text", async ctx => {
     const text = ctx.message.text.trim();
@@ -139,7 +148,13 @@ export function createBot(deps: {
 
       await executeSkillRequest(
         ctx,
-        { config: deps.config, db: deps.db, skillExecutor: deps.skillExecutor, skillName: decision.skill },
+        {
+          config: deps.config,
+          db: deps.db,
+          walletManager: deps.walletManager,
+          skillExecutor: deps.skillExecutor,
+          skillName: decision.skill
+        },
         rawInput,
         { forceConfirmation: true }
       );
@@ -154,22 +169,15 @@ export function createBot(deps: {
       const quoteId = data.slice("confirm:".length);
       const { telegramId, chatId } = assertPrivateChatContext(ctx);
       const user = deps.walletManager.getExistingUser(telegramId);
-      const session = deps.db.getSession(user.id, chatId);
+      const quote = deps.db.getQuote(quoteId);
+      const sessionUserId = quote?.requester_user_id ?? user.id;
+      const session = deps.db.getSession(sessionUserId, chatId);
       const sessionState = parseSessionQuoteState(session);
 
       if (!sessionState || sessionState.quote_id !== quoteId) {
         await ctx.answerCbQuery("This confirmation is no longer valid.");
         return;
       }
-
-      const stateJson = session?.state_json ?? "";
-      const consumed = deps.db.consumeSessionState(user.id, chatId, stateJson);
-      if (!consumed) {
-        await ctx.answerCbQuery("This confirmation was already used.");
-        return;
-      }
-
-      await ctx.answerCbQuery("Confirmed.");
 
       const result = await deps.skillExecutor.executeApprovedQuote(quoteId, {
         telegramId,
@@ -179,12 +187,16 @@ export function createBot(deps: {
           lastName: ctx.from?.last_name ?? null
         },
         telegramChatId: chatId,
+        telegramChatType: ctx.chat?.type,
         telegramMessageId:
           ctx.callbackQuery && "message" in ctx.callbackQuery && ctx.callbackQuery.message
             ? String(ctx.callbackQuery.message.message_id)
             : null
       });
 
+      const stateJson = session?.state_json ?? "";
+      deps.db.consumeSessionState(sessionUserId, chatId, stateJson);
+      await ctx.answerCbQuery("Confirmed.");
       await replyWithSkillResult(ctx, result);
     } catch (error) {
       if (error instanceof QuoteError) {
@@ -201,7 +213,9 @@ export function createBot(deps: {
       const quoteId = data.slice("cancel:".length);
       const { telegramId, chatId } = assertPrivateChatContext(ctx);
       const user = deps.walletManager.getExistingUser(telegramId);
-      const session = deps.db.getSession(user.id, chatId);
+      const quote = deps.db.getQuote(quoteId);
+      const sessionUserId = quote?.requester_user_id ?? user.id;
+      const session = deps.db.getSession(sessionUserId, chatId);
       const sessionState = parseSessionQuoteState(session);
 
       if (!sessionState || sessionState.quote_id !== quoteId) {
@@ -209,8 +223,20 @@ export function createBot(deps: {
         return;
       }
 
+      if (quote) {
+        const userHash = hashTelegramId(telegramId, deps.config.MASTER_ENCRYPTION_KEY);
+        const isRequester = quote.user_hash === userHash;
+        const isGroupAdmin =
+          quote.group_id !== null && deps.walletManager.isGroupAdmin(quote.group_id, user.id);
+
+        if (!isRequester && !isGroupAdmin) {
+          await ctx.answerCbQuery("This confirmation does not belong to your account.");
+          return;
+        }
+      }
+
       const stateJson = session?.state_json ?? "";
-      const consumed = deps.db.consumeSessionState(user.id, chatId, stateJson);
+      const consumed = deps.db.consumeSessionState(sessionUserId, chatId, stateJson);
       if (!consumed) {
         await ctx.answerCbQuery("This confirmation was already used.");
         return;

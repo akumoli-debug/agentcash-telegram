@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AppConfig } from "../config.js";
-import { AppDatabase, type WalletRow } from "../db/client.js";
+import { AppDatabase, type GroupRow, type UserRow, type WalletRow } from "../db/client.js";
 import { hashSensitiveValue, hashTelegramId } from "../lib/crypto.js";
 import {
   AgentCashError,
@@ -9,7 +9,7 @@ import {
   SpendingCapError,
   ValidationError
 } from "../lib/errors.js";
-import { withUserLock } from "../lib/userLock.js";
+import { defaultLockManager, type LockManager } from "../lib/lockManager.js";
 import type { AppLogger } from "../lib/logger.js";
 import { WalletManager, type TelegramProfile } from "../wallets/walletManager.js";
 import { AgentCashClient, type AgentCashFetchResult } from "./agentcashClient.js";
@@ -20,6 +20,7 @@ export interface SkillExecutionContext {
   telegramId: string;
   telegramProfile?: TelegramProfile;
   telegramChatId: string;
+  telegramChatType?: string;
   telegramMessageId?: string | null;
   forceConfirmation?: boolean;
 }
@@ -155,13 +156,16 @@ const skillDefinitions: Record<SkillName, SkillDefinition<string>> = {
   generate: generateSkill
 };
 
+const EXECUTION_LOCK_TTL_MS = 120_000;
+
 export class SkillExecutor {
   constructor(
     private readonly db: AppDatabase,
     private readonly walletManager: WalletManager,
     private readonly agentcashClient: AgentCashClient,
     private readonly logger: AppLogger,
-    private readonly config: AppConfig
+    private readonly config: AppConfig,
+    private readonly lockManager: LockManager = defaultLockManager
   ) {}
 
   getSkillDefinition(name: SkillName): SkillDefinition<string> {
@@ -185,8 +189,9 @@ export class SkillExecutor {
     const userHash = hashTelegramId(context.telegramId, this.config.MASTER_ENCRYPTION_KEY);
     const requestHash = hashSensitiveValue(canonicalJson, this.config.MASTER_ENCRYPTION_KEY);
 
-    return withUserLock(userHash, async () => {
-      const { user, wallet } = await this._getWallet(context, userHash, skill.name);
+    return this.lockManager.withLock(`actor:${userHash}`, EXECUTION_LOCK_TTL_MS, async () => {
+      const walletContext = await this._getWallet(context, userHash, skill.name);
+      const { user, wallet, group } = walletContext;
 
       const balance = await this._getBalance(wallet, userHash, skill.name);
 
@@ -242,6 +247,14 @@ export class SkillExecutor {
         Date.now() + this.config.PENDING_CONFIRMATION_TTL_SECONDS * 1000
       ).toISOString();
 
+      const confirmationCap = group
+        ? this.walletManager.getGroupConfirmationCap(group)
+        : this.walletManager.getConfirmationCap(user);
+      const requiresGroupAdminApproval =
+        Boolean(group) &&
+        confirmationCap !== undefined &&
+        quotedCostCents > Math.round(confirmationCap * 100);
+
       const quote = this.db.createQuote({
         userHash,
         walletId: wallet.id,
@@ -252,10 +265,12 @@ export class SkillExecutor {
         quotedCostCents,
         maxApprovedCostCents,
         isDevUnquoted,
-        expiresAt
+        expiresAt,
+        requesterUserId: user.id,
+        groupId: group?.id ?? null,
+        requiresGroupAdminApproval
       });
 
-      const confirmationCap = this.walletManager.getConfirmationCap(user);
       const needsConfirmation =
         context.forceConfirmation ||
         (confirmationCap !== undefined && quotedCostCents > Math.round(confirmationCap * 100));
@@ -266,8 +281,13 @@ export class SkillExecutor {
           : `This ${skill.name} call is quoted at ${formatUsdCents(quotedCostCents)}.`;
         const capLine =
           confirmationCap !== undefined
-            ? `Your per-call confirmation cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
+            ? group
+              ? `This group's per-call cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
+              : `Your per-call confirmation cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
             : "Natural language requests always require confirmation.";
+        const approvalLine = requiresGroupAdminApproval
+          ? "Because this is over the group cap, an owner or admin must confirm."
+          : "Confirm to proceed or cancel to stop.";
         const expiryMin = Math.ceil(this.config.PENDING_CONFIRMATION_TTL_SECONDS / 60);
 
         return {
@@ -276,7 +296,7 @@ export class SkillExecutor {
             costLine,
             capLine,
             `This confirmation expires in ${expiryMin} minute${expiryMin !== 1 ? "s" : ""}.`,
-            "Confirm to proceed or cancel to stop."
+            approvalLine
           ].join("\n"),
           quoteId: quote.id,
           skill: skill.name,
@@ -305,7 +325,8 @@ export class SkillExecutor {
   ): Promise<{ type: "completed" } & SkillRenderResult> {
     const userHash = hashTelegramId(context.telegramId, this.config.MASTER_ENCRYPTION_KEY);
 
-    return withUserLock(userHash, async () => {
+    return this.lockManager.withLock(`actor:${userHash}`, EXECUTION_LOCK_TTL_MS, async () =>
+      this.lockManager.withLock(`quote:${quoteId}`, EXECUTION_LOCK_TTL_MS, async () => {
       const quote = this.db.getQuote(quoteId);
 
       if (!quote) {
@@ -319,7 +340,18 @@ export class SkillExecutor {
         throw new QuoteError("This confirmation is no longer valid.");
       }
 
-      if (quote.user_hash !== userHash) {
+      const group = quote.group_id ? this.db.getGroupById(quote.group_id) : undefined;
+      const confirmerUser = this.db.getUserByTelegramId(context.telegramId);
+      const chatHash = WalletManager.getHashedChatId(
+        context.telegramChatId,
+        this.config.MASTER_ENCRYPTION_KEY
+      );
+
+      if (quote.group_id && !group) {
+        throw new QuoteError("This group confirmation is no longer valid.");
+      }
+
+      if (!group && quote.user_hash !== userHash) {
         this.db.logPreflightAttempt({
           userHash,
           walletId: quote.wallet_id,
@@ -329,6 +361,48 @@ export class SkillExecutor {
           safeErrorMessage: "Quote ownership mismatch during confirm"
         });
         throw new QuoteError("This confirmation does not belong to your account.");
+      }
+
+      if (group) {
+        if (group.telegram_chat_id_hash !== chatHash) {
+          this.db.logPreflightAttempt({
+            userHash,
+            walletId: quote.wallet_id,
+            skill: quote.skill,
+            failureStage: "replay",
+            errorCode: "QUOTE_GROUP_CHAT_MISMATCH",
+            safeErrorMessage: "Group quote confirmed from a different chat"
+          });
+          throw new QuoteError("This group confirmation is no longer valid.");
+        }
+
+        const isRequester = quote.user_hash === userHash;
+        const isAdmin =
+          Boolean(confirmerUser) && this.walletManager.isGroupAdmin(group.id, confirmerUser!.id);
+
+        if (quote.requires_group_admin_approval && !isAdmin) {
+          this.db.logPreflightAttempt({
+            userHash,
+            walletId: quote.wallet_id,
+            skill: quote.skill,
+            failureStage: "replay",
+            errorCode: "GROUP_APPROVER_NOT_AUTHORIZED",
+            safeErrorMessage: "Non-admin attempted to approve over-cap group quote"
+          });
+          throw new QuoteError("Only a group wallet owner or admin can confirm this over-cap request.");
+        }
+
+        if (!quote.requires_group_admin_approval && !isRequester && !isAdmin) {
+          this.db.logPreflightAttempt({
+            userHash,
+            walletId: quote.wallet_id,
+            skill: quote.skill,
+            failureStage: "replay",
+            errorCode: "QUOTE_OWNER_MISMATCH",
+            safeErrorMessage: "Non-requester attempted to confirm group quote"
+          });
+          throw new QuoteError("This confirmation does not belong to your account.");
+        }
       }
 
       if (quote.status !== "pending") {
@@ -377,16 +451,32 @@ export class SkillExecutor {
       const skill = this.getSkillDefinition(quote.skill as SkillName);
       const requestBody = JSON.parse(quote.canonical_request_json) as Record<string, unknown>;
 
-      return this._runApprovedQuote(quoteId, wallet, requestBody, skill, userHash);
-    });
+        return this._runApprovedQuote(quoteId, wallet, requestBody, skill, quote.user_hash);
+      })
+    );
   }
 
   private async _getWallet(
     context: SkillExecutionContext,
     userHash: string,
     skillName: string
-  ) {
+  ): Promise<{ user: UserRow; wallet: WalletRow; group?: GroupRow }> {
     try {
+      if (context.telegramChatType && context.telegramChatType !== "private") {
+        const groupContext = await this.walletManager.getGroupWalletForTelegramChat(
+          context.telegramChatId,
+          context.telegramId
+        );
+
+        if (!groupContext) {
+          throw new ValidationError(
+            "This group does not have a wallet yet. Ask an owner to run /groupwallet create first."
+          );
+        }
+
+        return groupContext;
+      }
+
       return await this.walletManager.getOrCreateWalletForTelegramUser(
         context.telegramId,
         context.telegramProfile
@@ -468,10 +558,16 @@ export class SkillExecutor {
     userHash: string
   ): Promise<{ type: "completed" } & SkillRenderResult> {
     const quote = this.db.getQuote(quoteId)!;
+    const requesterUserId = quote.requester_user_id ?? wallet.owner_user_id;
+
+    if (!requesterUserId) {
+      throw new AgentCashError("Requester not found for this confirmation.");
+    }
 
     const transaction = this.db.createTransaction({
-      userId: wallet.owner_user_id!,
+      userId: requesterUserId,
       walletId: wallet.id,
+      groupId: quote.group_id ?? null,
       telegramChatId: userHash,
       telegramIdHash: userHash,
       commandName: skill.name,

@@ -1,40 +1,21 @@
 import type { Context } from "telegraf";
-import { AppDatabase } from "../db/client.js";
-import { WalletManager } from "../wallets/walletManager.js";
-import { getExecutionContext } from "./helpers.js";
+import type { SkillExecutor } from "../agentcash/skillExecutor.js";
+import type { AppConfig } from "../config.js";
+import type { AppDatabase } from "../db/client.js";
+import { runDepositCommand } from "../core/commandHandlers.js";
+import type { WalletManager } from "../wallets/walletManager.js";
+import { createTelegramCommandContext } from "./helpers.js";
 import { replyWithError } from "./replyWithError.js";
 
 export function createDepositCommand(deps: {
+  config: AppConfig;
   db: AppDatabase;
   walletManager: WalletManager;
+  skillExecutor: SkillExecutor;
 }) {
   return async (ctx: Context) => {
     try {
-      const executionContext = getExecutionContext(ctx);
-      const { user, deposit } = await deps.walletManager.getDepositAddress(
-        executionContext.telegramId,
-        executionContext.telegramProfile
-      );
-
-      deps.db.upsertSession({
-        userId: user.id,
-        telegramChatId: executionContext.telegramChatId,
-        currentCommand: "deposit",
-        stateJson: null
-      });
-
-      const qrDataUrl = await deps.walletManager.getDepositQrDataUrl(deposit.address ?? "");
-      const base64 = qrDataUrl.split(",")[1];
-
-      await ctx.replyWithPhoto(
-        { source: Buffer.from(base64 ?? "", "base64") },
-        {
-          caption: [
-            `Deposit address: ${deposit.address ?? "unavailable"}`,
-            deposit.depositLink ? `Deposit link: ${deposit.depositLink}` : "Deposit link: unavailable"
-          ].join("\n")
-        }
-      );
+      await runDepositCommand(createTelegramCommandContext(ctx, deps.config), deps);
     } catch (error) {
       await replyWithError(ctx, error);
     }

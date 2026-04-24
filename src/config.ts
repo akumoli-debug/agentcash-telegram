@@ -7,15 +7,21 @@ loadDotEnv();
 
 const envSchema = z
   .object({
-    TELEGRAM_BOT_TOKEN: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
+    TELEGRAM_BOT_TOKEN: z.string().trim().optional(),
+    TELEGRAM_BOT_USERNAME: z.string().trim().optional(),
+    DISCORD_BOT_TOKEN: z.string().trim().optional(),
+    DISCORD_APPLICATION_ID: z.string().trim().optional(),
     DATABASE_PATH: z.string().default(".data/agentcash-telegram.db"),
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+    NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     BOT_MODE: z.enum(["polling", "webhook"]).default("polling"),
     WEBHOOK_DOMAIN: z.string().trim().optional(),
     WEBHOOK_PATH: z.string().default("/telegram/webhook"),
     WEBHOOK_HOST: z.string().default("0.0.0.0"),
     WEBHOOK_PORT: z.coerce.number().int().positive().default(3000),
     WEBHOOK_SECRET_TOKEN: z.string().trim().optional(),
+    HEALTH_HOST: z.string().default("0.0.0.0"),
+    HEALTH_PORT: z.coerce.number().int().positive().default(3001),
     AGENTCASH_COMMAND: z.string().default("npx"),
     AGENTCASH_ARGS: z.string().default("agentcash@latest"),
     AGENTCASH_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
@@ -45,11 +51,35 @@ const envSchema = z
       .refine(value => decodeMasterKey(value).length === 32, "MASTER_ENCRYPTION_KEY must decode to 32 bytes")
   })
   .superRefine((values, ctx) => {
+    if (!values.TELEGRAM_BOT_TOKEN && !values.DISCORD_BOT_TOKEN) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "At least one bot token is required: TELEGRAM_BOT_TOKEN or DISCORD_BOT_TOKEN",
+        path: ["TELEGRAM_BOT_TOKEN"]
+      });
+    }
+
+    if (values.DISCORD_BOT_TOKEN && !values.DISCORD_APPLICATION_ID) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "DISCORD_APPLICATION_ID is required when DISCORD_BOT_TOKEN is set",
+        path: ["DISCORD_APPLICATION_ID"]
+      });
+    }
+
     if (values.BOT_MODE === "webhook" && !values.WEBHOOK_DOMAIN) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: "WEBHOOK_DOMAIN is required when BOT_MODE=webhook",
         path: ["WEBHOOK_DOMAIN"]
+      });
+    }
+
+    if (values.BOT_MODE === "webhook" && !values.WEBHOOK_SECRET_TOKEN) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "WEBHOOK_SECRET_TOKEN is required when BOT_MODE=webhook",
+        path: ["WEBHOOK_SECRET_TOKEN"]
       });
     }
   });

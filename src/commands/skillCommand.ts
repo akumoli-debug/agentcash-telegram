@@ -1,19 +1,16 @@
 import type { Context } from "telegraf";
 import { type SkillExecutor, type SkillName } from "../agentcash/skillExecutor.js";
 import type { AppConfig } from "../config.js";
+import { runSkillCommand } from "../core/commandHandlers.js";
 import type { AppDatabase } from "../db/client.js";
-import {
-  confirmationKeyboard,
-  ensureUserRecord,
-  getCommandArgument,
-  getExecutionContext,
-  replyWithSkillResult
-} from "./helpers.js";
+import type { WalletManager } from "../wallets/walletManager.js";
+import { createTelegramCommandContext, getCommandArgument } from "./helpers.js";
 import { replyWithError } from "./replyWithError.js";
 
 export interface SkillCommandDeps {
   config: AppConfig;
   db: AppDatabase;
+  walletManager: WalletManager;
   skillExecutor: SkillExecutor;
   skillName: SkillName;
 }
@@ -34,33 +31,11 @@ export async function executeSkillRequest(
   rawInput: string,
   options?: { forceConfirmation?: boolean }
 ): Promise<void> {
-  const user = ensureUserRecord(deps.db, ctx, deps.config.DEFAULT_SPEND_CAP_USDC);
-  const executionContext = getExecutionContext(ctx);
-
-  deps.db.upsertSession({
-    userId: user.id,
-    telegramChatId: executionContext.telegramChatId,
-    currentCommand: deps.skillName,
-    stateJson: null
-  });
-
-  const result = await deps.skillExecutor.execute(deps.skillName, rawInput, {
-    ...executionContext,
-    forceConfirmation: options?.forceConfirmation
-  });
-
-  if (result.type === "confirmation_required") {
-    deps.db.upsertSession({
-      userId: user.id,
-      telegramChatId: executionContext.telegramChatId,
-      currentCommand: deps.skillName,
-      stateJson: JSON.stringify({ type: "quote_confirmation", quote_id: result.quoteId })
-    });
-
-    await ctx.reply(result.text, confirmationKeyboard(result.quoteId));
-    return;
-  }
-
-  deps.db.clearSessionState(user.id, executionContext.telegramChatId);
-  await replyWithSkillResult(ctx, result);
+  await runSkillCommand(
+    createTelegramCommandContext(ctx, deps.config),
+    deps,
+    deps.skillName,
+    rawInput,
+    options
+  );
 }

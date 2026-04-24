@@ -1,5 +1,36 @@
 export const schemaStatements = [
   `
+    CREATE TABLE IF NOT EXISTS groups (
+      id TEXT PRIMARY KEY,
+      telegram_chat_id_hash TEXT NOT NULL UNIQUE,
+      title_hash TEXT,
+      wallet_id TEXT NOT NULL UNIQUE,
+      created_by_user_id TEXT NOT NULL,
+      cap_enabled INTEGER NOT NULL DEFAULT 1,
+      spend_cap_usdc REAL NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (created_by_user_id) REFERENCES users(id)
+    )
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS group_members (
+      id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (group_id) REFERENCES groups(id),
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      UNIQUE(group_id, user_id)
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS group_members_group_role_idx
+    ON group_members(group_id, role)
+  `,
+  `
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       telegram_user_id TEXT NOT NULL UNIQUE,
@@ -69,6 +100,9 @@ export const schemaStatements = [
       approved_at TEXT,
       executed_at TEXT,
       transaction_id TEXT,
+      requester_user_id TEXT,
+      group_id TEXT,
+      requires_group_admin_approval INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY (wallet_id) REFERENCES wallets(id)
     )
   `,
@@ -89,6 +123,7 @@ export const schemaStatements = [
       telegram_chat_id TEXT NOT NULL,
       telegram_message_id TEXT,
       telegram_id_hash TEXT,
+      group_id TEXT,
       command_name TEXT NOT NULL,
       skill TEXT,
       origin TEXT,
@@ -111,7 +146,8 @@ export const schemaStatements = [
       FOREIGN KEY (user_id) REFERENCES users(id),
       FOREIGN KEY (wallet_id) REFERENCES wallets(id),
       FOREIGN KEY (session_id) REFERENCES sessions(id),
-      FOREIGN KEY (quote_id) REFERENCES quotes(id)
+      FOREIGN KEY (quote_id) REFERENCES quotes(id),
+      FOREIGN KEY (group_id) REFERENCES groups(id)
     )
   `,
   `
@@ -121,6 +157,10 @@ export const schemaStatements = [
   `
     CREATE INDEX IF NOT EXISTS transactions_telegram_hash_created_at_idx
     ON transactions(telegram_id_hash, created_at DESC)
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS transactions_group_created_at_idx
+    ON transactions(group_id, created_at DESC)
   `,
   `
     CREATE TABLE IF NOT EXISTS preflight_attempts (
@@ -139,6 +179,43 @@ export const schemaStatements = [
   `
     CREATE INDEX IF NOT EXISTS preflight_attempts_user_hash_idx
     ON preflight_attempts(user_hash, created_at DESC)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS audit_events (
+      id TEXT PRIMARY KEY,
+      event_name TEXT NOT NULL,
+      wallet_id TEXT,
+      quote_id TEXT,
+      transaction_id TEXT,
+      actor_hash TEXT,
+      group_id TEXT,
+      status TEXT,
+      metadata_json TEXT,
+      created_at TEXT NOT NULL
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS audit_events_name_created_at_idx
+    ON audit_events(event_name, created_at DESC)
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS audit_events_quote_idx
+    ON audit_events(quote_id, created_at DESC)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS inline_payloads (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      payload_json TEXT NOT NULL,
+      signature TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS inline_payloads_expires_at_idx
+    ON inline_payloads(expires_at)
   `,
   `
     CREATE TABLE IF NOT EXISTS sessions (

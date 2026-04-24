@@ -22,6 +22,25 @@ describe("security config", () => {
     expect(() => getConfig()).toThrowError(ConfigError);
   });
 
+  it("requires a webhook secret token in webhook mode", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "test-token";
+    process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 11).toString("base64");
+    process.env.BOT_MODE = "webhook";
+    process.env.WEBHOOK_DOMAIN = "https://example.com";
+    delete process.env.WEBHOOK_SECRET_TOKEN;
+
+    expect(() => getConfig()).toThrowError(ConfigError);
+  });
+
+  it("requires Discord application ID when Discord bot token is set", () => {
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    process.env.DISCORD_BOT_TOKEN = "discord-token";
+    delete process.env.DISCORD_APPLICATION_ID;
+    process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 12).toString("base64");
+
+    expect(() => getConfig()).toThrowError(ConfigError);
+  });
+
   it("exposes secure rate limit defaults", () => {
     process.env.TELEGRAM_BOT_TOKEN = "test-token";
     process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 10).toString("base64");

@@ -6,6 +6,8 @@ import { AgentCashClient } from "./agentcash/agentcashClient.js";
 import { SkillExecutor } from "./agentcash/skillExecutor.js";
 import { RouterClient } from "./router/routerClient.js";
 import { createBot } from "./bot.js";
+import { createDiscordBot, registerDiscordCommands } from "./discordBot.js";
+import { startHealthServer } from "./healthServer.js";
 
 async function main() {
   const config = getConfig();
@@ -13,6 +15,7 @@ async function main() {
   const db = new AppDatabase(config.DATABASE_PATH);
 
   db.initialize();
+  const healthServer = startHealthServer(config, logger);
 
   const agentcashClient = new AgentCashClient(config);
 
@@ -31,18 +34,34 @@ async function main() {
   const walletManager = new WalletManager(db, config, agentcashClient);
   const skillExecutor = new SkillExecutor(db, walletManager, agentcashClient, logger, config);
   const routerClient = new RouterClient(config, logger);
-  const bot = createBot({ config, logger, db, walletManager, skillExecutor, routerClient });
+  const bot = config.TELEGRAM_BOT_TOKEN
+    ? createBot({ config, logger, db, walletManager, skillExecutor, routerClient })
+    : null;
+  const discordBot = config.DISCORD_BOT_TOKEN
+    ? createDiscordBot({ config, logger, db, walletManager, skillExecutor })
+    : null;
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "shutting down");
-    bot.stop(signal);
+    if (bot) {
+      bot.stop(signal);
+    }
+    if (discordBot) {
+      discordBot.destroy();
+    }
+    healthServer.close();
     db.close();
   };
 
   process.once("SIGINT", () => { void shutdown("SIGINT"); });
   process.once("SIGTERM", () => { void shutdown("SIGTERM"); });
 
-  if (config.BOT_MODE === "webhook") {
+  if (discordBot && config.DISCORD_BOT_TOKEN) {
+    await registerDiscordCommands(config);
+    await discordBot.login(config.DISCORD_BOT_TOKEN);
+  }
+
+  if (bot && config.BOT_MODE === "webhook") {
     await bot.launch({
       webhook: {
         domain: config.WEBHOOK_DOMAIN!,
@@ -59,7 +78,9 @@ async function main() {
     return;
   }
 
-  await bot.launch();
+  if (bot) {
+    await bot.launch();
+  }
   logger.info({ mode: "polling" }, "agentcash-telegram bot started");
 }
 

@@ -16,6 +16,7 @@ export function createHelpCommand() {
         "/enrich <email> - run the enrichment skill",
         "/generate <prompt> - run the image generation skill",
         "/history - show your last 10 transactions",
+        "/groupwallet help - manage a group wallet in a Telegram group",
         "",
         "Calls above your cap ask for confirmation. Calls above the MVP hard cap are blocked.",
         "Every paid call creates an immutable quote record before execution."

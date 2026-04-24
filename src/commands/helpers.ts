@@ -2,7 +2,10 @@ import type { Context } from "telegraf";
 import { Markup } from "telegraf";
 import { z } from "zod";
 import type { SkillExecutionContext } from "../agentcash/skillExecutor.js";
+import type { AppConfig } from "../config.js";
+import type { CommandContext } from "../core/commandContext.js";
 import type { AppDatabase, SessionRow, UserRow } from "../db/client.js";
+import { hashSensitiveValue, hashTelegramId } from "../lib/crypto.js";
 import { AppError, ValidationError } from "../lib/errors.js";
 import type { TelegramProfile } from "../wallets/walletManager.js";
 
@@ -44,8 +47,41 @@ export function getExecutionContext(ctx: Context): SkillExecutionContext {
     telegramId,
     telegramProfile: getTelegramProfile(ctx),
     telegramChatId: String(ctx.chat?.id ?? ctx.from?.id ?? ""),
+    telegramChatType: ctx.chat?.type,
     telegramMessageId:
       ctx.message && "message_id" in ctx.message ? String(ctx.message.message_id) : null
+  };
+}
+
+export function createTelegramCommandContext(ctx: Context, config: AppConfig): CommandContext {
+  const telegramId = String(ctx.from?.id ?? "");
+  const chatId = String(ctx.chat?.id ?? ctx.from?.id ?? "");
+
+  if (!telegramId || !chatId) {
+    throw new ValidationError("Could not identify this Telegram conversation.");
+  }
+
+  return {
+    platform: "telegram",
+    actorIdHash: hashTelegramId(telegramId, config.MASTER_ENCRYPTION_KEY),
+    chatIdHash: hashSensitiveValue(`chat:${chatId}`, config.MASTER_ENCRYPTION_KEY).slice(0, 24),
+    walletScope: {
+      kind: "user",
+      walletOwnerId: telegramId,
+      chatId,
+      chatType: ctx.chat?.type
+    },
+    actorProfile: getTelegramProfile(ctx),
+    messageId: ctx.message && "message_id" in ctx.message ? String(ctx.message.message_id) : null,
+    reply: async message => {
+      await ctx.reply(message);
+    },
+    replyPrivateOrEphemeral: async message => {
+      await ctx.reply(message);
+    },
+    confirm: async input => {
+      await ctx.reply(input.text, confirmationKeyboard(input.quoteId));
+    }
   };
 }
 

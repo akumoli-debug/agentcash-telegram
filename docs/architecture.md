@@ -6,6 +6,7 @@
 - Node 20+
 - `pnpm` package management
 - `telegraf` for Telegram transport
+- `discord.js` for Discord transport
 - `better-sqlite3` for local persistence
 - `zod` for configuration and command validation
 - `pino` for structured logging
@@ -15,13 +16,18 @@
 - `src/index.ts` — process bootstrap, config, startup health check, bot lifecycle
 - `src/config.ts` — env parsing and runtime config
 - `src/bot.ts` — Telegraf bot creation, middleware, command registration, confirm/cancel handlers
+- `src/discordBot.ts` — Discord slash command and button adapter
+- `src/core/*` — transport-neutral command context and command logic
 - `src/db/schema.ts` — SQLite schema definitions
 - `src/db/client.ts` — typed SQLite access, quote operations, preflight logging, history query
+- `src/db/adapter.ts` — small TODO seam for future Postgres migration
 - `src/wallets/walletManager.ts` — wallet records, spend caps, per-user locking for provisioning
 - `src/agentcash/agentcashClient.ts` — **single boundary for AgentCash CLI integration** (startup health check here)
 - `src/agentcash/skillExecutor.ts` — quote creation, confirmation flow, approved-quote execution
 - `src/commands/*` — per-command handlers
-- `src/lib/userLock.ts` — per-user async lock (prevents concurrent wallet provisioning and double-execution)
+- `src/lib/lockManager.ts` — lock abstraction and local in-process implementation
+- `src/lib/userLock.ts` — compatibility wrapper over the local lock manager
+- `src/healthServer.ts` — `/healthz` and `/readyz` HTTP server
 - `src/lib/crypto.ts` — AES-256-GCM encryption, HMAC hashing
 - `src/lib/errors.ts` — typed error classes including `QuoteError`
 - `src/lib/logger.ts` — pino with secret redaction
@@ -38,16 +44,18 @@ transactions        — execution audit trail linked to quotes
 preflight_attempts  — failed quote/balance/cap/replay attempts
 sessions            — active quote_id per chat (for confirm/cancel routing)
 request_events      — rate limit event log (pruned after 2 hours)
+audit_events        — structured sanitized audit trail
+inline_payloads     — signed short-lived inline start payloads
 ```
 
-Group wallets are a schema affordance (`wallets.kind IN ('user','group')`) but not implemented in runtime code.
+Telegram group wallets are experimental and use `wallets.kind='group'`. Discord guild wallets are not enabled in the MVP.
 
 ## Paid command execution flow
 
 Every paid call through `/research`, `/enrich`, `/generate`, or NL routing goes through this sequence:
 
 1. **Validate input** — Zod validator on raw user input
-2. **Get wallet** — provision or retrieve via `walletManager.getOrCreateWalletForTelegramUser`; locked per user hash
+2. **Get wallet** — provision or retrieve via wallet manager; locked through `LockManager`
 3. **Get balance** — `agentcashClient.getBalance`
 4. **Get quote** — `agentcashClient.checkEndpoint` must return a bounded cost estimate
    - If check fails and `ALLOW_UNQUOTED_DEV_CALLS=false`: log preflight failure, throw `QuoteError`
@@ -62,7 +70,7 @@ Every paid call through `/research`, `/enrich`, `/generate`, or NL routing goes 
    - Creates transaction record
    - Calls `agentcashClient.fetchJson`
    - Marks `executed`, links transaction ID
-10. **Audit** — all failures update quote status and log to `preflight_attempts`
+10. **Audit** — all failures update quote status and log to `preflight_attempts`; sanitized lifecycle events are written to `audit_events`
 
 ## Confirmation flow (security detail)
 
@@ -79,7 +87,13 @@ All CLI interactions are in `agentcashClient.ts`. Startup health check verifies:
 1. CLI binary is executable
 2. Home root directory is writable
 
-If either fails, the process exits with a clear error before accepting Telegram traffic.
+If either fails, the process exits with a clear error before accepting traffic.
+
+## Deployment scaffold
+
+The repository includes Docker and Docker Compose scaffolding plus a health endpoint. This is for demos and staging-like testing. It is not production custody readiness.
+
+Webhook mode requires `WEBHOOK_SECRET_TOKEN` and `WEBHOOK_DOMAIN`. SQLite remains local-only; `src/db/adapter.ts` marks the seam for a future full Postgres migration.
 
 ## PII boundary
 
