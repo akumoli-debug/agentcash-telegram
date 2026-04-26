@@ -122,9 +122,11 @@ function checkReadme(root: string, failures: string[]): void {
   }
 
   const requiredSections = [
+    "## Competitive Context",
+    "## Why This Exists",
     "## Demo",
-    "## What Works Today",
-    "## Experimental Features",
+    "## Feature Status",
+    "## Implementation Evidence",
     "## Payment Safety Model",
     "## Supported Platforms",
     "## Commands",
@@ -134,7 +136,7 @@ function checkReadme(root: string, failures: string[]): void {
     "## Tests",
     "## Security Posture",
     "## Roadmap",
-    "## Why This Matters For AgentCash/Merit"
+    "## Why This Matters"
   ];
 
   for (const section of requiredSections) {

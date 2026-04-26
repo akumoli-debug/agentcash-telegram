@@ -44,9 +44,11 @@ const requiredEnvVars = [
 ];
 
 const requiredReadmeSections = [
+  "## Competitive Context",
+  "## Why This Exists",
   "## Demo",
-  "## What Works Today",
-  "## Experimental Features",
+  "## Feature Status",
+  "## Implementation Evidence",
   "## Payment Safety Model",
   "## Supported Platforms",
   "## Commands",
@@ -56,7 +58,7 @@ const requiredReadmeSections = [
   "## Tests",
   "## Security Posture",
   "## Roadmap",
-  "## Why This Matters For AgentCash/Merit"
+  "## Why This Matters"
 ];
 
 const requiredDocs = [
