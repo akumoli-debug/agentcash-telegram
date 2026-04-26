@@ -305,6 +305,50 @@ export interface PolicyDecisionRow {
   decided_at: string;
 }
 
+export interface SkillSpendRow {
+  skill: string;
+  cents: number;
+  count: number;
+}
+
+export interface ActorSpendRow {
+  actor_hash: string;
+  cents: number;
+  count: number;
+}
+
+export interface EndpointSpendRow {
+  endpoint: string;
+  cents: number;
+  count: number;
+}
+
+export interface DailySpendRow {
+  date: string;
+  cents: number;
+}
+
+export interface QuoteStatsRow {
+  total: number;
+  succeeded: number;
+  denied: number;
+}
+
+export interface EstimatedVsActualRow {
+  estimatedCents: number;
+  actualCents: number;
+  count: number;
+}
+
+export interface TransactionExportRow {
+  date: string;
+  skill: string;
+  status: string;
+  estimated_usdc: string;
+  actual_usdc: string;
+  request_hash: string;
+}
+
 export interface AuditEventRow {
   id: string;
   event_name: string;
@@ -699,6 +743,14 @@ export class AppDatabase {
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS policy_decisions_wallet_decided_at_idx
       ON policy_decisions(wallet_id, decided_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS transactions_wallet_created_at_idx
+      ON transactions(wallet_id, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS preflight_attempts_wallet_created_at_idx
+      ON preflight_attempts(wallet_id, created_at DESC)
     `);
   }
 
@@ -2459,6 +2511,200 @@ export class AppDatabase {
     return this.sqlite
       .prepare("SELECT * FROM policy_decisions WHERE quote_id = ?")
       .get(quoteId) as PolicyDecisionRow | undefined;
+  }
+
+  // ─── Spend analytics ───────────────────────────────────────────────────────
+
+  private txSpendBySkill(col: "wallet_id" | "group_id", id: string, sinceIso: string): SkillSpendRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT COALESCE(skill, 'unknown') AS skill,
+                COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS cents,
+                COUNT(*) AS count
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ? AND status IN ('submitted', 'success')
+         GROUP BY skill ORDER BY cents DESC`
+      )
+      .all(id, sinceIso) as SkillSpendRow[];
+  }
+
+  getWalletSpendBySkill(walletId: string, sinceIso: string): SkillSpendRow[] {
+    return this.txSpendBySkill("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupSpendBySkill(groupId: string, sinceIso: string): SkillSpendRow[] {
+    return this.txSpendBySkill("group_id", groupId, sinceIso);
+  }
+
+  private txSpendByActor(col: "wallet_id" | "group_id", id: string, sinceIso: string): ActorSpendRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT COALESCE(telegram_id_hash, 'unknown') AS actor_hash,
+                COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS cents,
+                COUNT(*) AS count
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ? AND status IN ('submitted', 'success')
+         GROUP BY telegram_id_hash ORDER BY cents DESC LIMIT 20`
+      )
+      .all(id, sinceIso) as ActorSpendRow[];
+  }
+
+  getWalletSpendByActor(walletId: string, sinceIso: string): ActorSpendRow[] {
+    return this.txSpendByActor("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupSpendByActor(groupId: string, sinceIso: string): ActorSpendRow[] {
+    return this.txSpendByActor("group_id", groupId, sinceIso);
+  }
+
+  private txSpendByEndpoint(col: "wallet_id" | "group_id", id: string, sinceIso: string): EndpointSpendRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT COALESCE(endpoint, 'unknown') AS endpoint,
+                COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS cents,
+                COUNT(*) AS count
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ? AND status IN ('submitted', 'success')
+         GROUP BY endpoint ORDER BY cents DESC LIMIT 5`
+      )
+      .all(id, sinceIso) as EndpointSpendRow[];
+  }
+
+  getWalletSpendByEndpoint(walletId: string, sinceIso: string): EndpointSpendRow[] {
+    return this.txSpendByEndpoint("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupSpendByEndpoint(groupId: string, sinceIso: string): EndpointSpendRow[] {
+    return this.txSpendByEndpoint("group_id", groupId, sinceIso);
+  }
+
+  private txDailySpendSeries(col: "wallet_id" | "group_id", id: string, sinceIso: string): DailySpendRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT DATE(created_at) AS date,
+                COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS cents
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ? AND status IN ('submitted', 'success')
+         GROUP BY DATE(created_at) ORDER BY date ASC`
+      )
+      .all(id, sinceIso) as DailySpendRow[];
+  }
+
+  getWalletDailySpendSeries(walletId: string, sinceIso: string): DailySpendRow[] {
+    return this.txDailySpendSeries("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupDailySpendSeries(groupId: string, sinceIso: string): DailySpendRow[] {
+    return this.txDailySpendSeries("group_id", groupId, sinceIso);
+  }
+
+  getWalletQuoteStats(walletId: string, sinceIso: string): QuoteStatsRow {
+    const total = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM quotes WHERE wallet_id = ? AND created_at >= ?`)
+        .get(walletId, sinceIso) as { n: number }
+    ).n;
+    const succeeded = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM quotes WHERE wallet_id = ? AND created_at >= ? AND status = 'succeeded'`)
+        .get(walletId, sinceIso) as { n: number }
+    ).n;
+    const denied = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM policy_decisions WHERE wallet_id = ? AND decided_at >= ? AND outcome LIKE 'deny_%'`)
+        .get(walletId, sinceIso) as { n: number }
+    ).n;
+    return { total, succeeded, denied };
+  }
+
+  getGroupQuoteStats(groupId: string, walletId: string, sinceIso: string): QuoteStatsRow {
+    const total = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM quotes WHERE group_id = ? AND created_at >= ?`)
+        .get(groupId, sinceIso) as { n: number }
+    ).n;
+    const succeeded = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM quotes WHERE group_id = ? AND created_at >= ? AND status = 'succeeded'`)
+        .get(groupId, sinceIso) as { n: number }
+    ).n;
+    const denied = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM policy_decisions WHERE wallet_id = ? AND decided_at >= ? AND outcome LIKE 'deny_%'`)
+        .get(walletId, sinceIso) as { n: number }
+    ).n;
+    return { total, succeeded, denied };
+  }
+
+  getWalletFailedTransactionCount(walletId: string, sinceIso: string): number {
+    const row = this.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM transactions WHERE wallet_id = ? AND created_at >= ? AND status = 'error'`)
+      .get(walletId, sinceIso) as { n: number };
+    return row.n;
+  }
+
+  getGroupFailedTransactionCount(groupId: string, sinceIso: string): number {
+    const row = this.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM transactions WHERE group_id = ? AND created_at >= ? AND status = 'error'`)
+      .get(groupId, sinceIso) as { n: number };
+    return row.n;
+  }
+
+  getWalletReplayAttemptCount(walletId: string, sinceIso: string): number {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS n FROM preflight_attempts
+         WHERE wallet_id = ? AND created_at >= ? AND failure_stage = 'replay'`
+      )
+      .get(walletId, sinceIso) as { n: number };
+    return row.n;
+  }
+
+  private txEstimatedVsActual(col: "wallet_id" | "group_id", id: string, sinceIso: string): EstimatedVsActualRow {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COALESCE(AVG(estimated_cost_cents), 0) AS estimatedCents,
+                COALESCE(AVG(actual_cost_cents), 0) AS actualCents,
+                COUNT(*) AS count
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ?
+           AND status IN ('submitted', 'success')
+           AND estimated_cost_cents IS NOT NULL
+           AND actual_cost_cents IS NOT NULL`
+      )
+      .get(id, sinceIso) as EstimatedVsActualRow;
+    return row;
+  }
+
+  getWalletEstimatedVsActual(walletId: string, sinceIso: string): EstimatedVsActualRow {
+    return this.txEstimatedVsActual("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupEstimatedVsActual(groupId: string, sinceIso: string): EstimatedVsActualRow {
+    return this.txEstimatedVsActual("group_id", groupId, sinceIso);
+  }
+
+  getTransactionsForExport(
+    filter: { walletId: string } | { groupId: string },
+    sinceIso: string,
+    limit = 500
+  ): TransactionExportRow[] {
+    const col = "walletId" in filter ? "wallet_id" : "group_id";
+    const id = "walletId" in filter ? filter.walletId : filter.groupId;
+    return this.sqlite
+      .prepare(
+        `SELECT DATE(created_at) AS date,
+                COALESCE(skill, 'unknown') AS skill,
+                status,
+                COALESCE(CAST(estimated_cost_cents AS REAL) / 100, 0) AS estimated_usdc,
+                COALESCE(CAST(actual_cost_cents AS REAL) / 100, 0) AS actual_usdc,
+                COALESCE(request_hash, '') AS request_hash
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ?
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(id, sinceIso, limit) as TransactionExportRow[];
   }
 
   private ensureWalletColumn(name: string, type: string) {

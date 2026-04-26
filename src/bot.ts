@@ -16,6 +16,7 @@ import { createCapCommand } from "./commands/cap.js";
 import { createHistoryCommand } from "./commands/history.js";
 import { createGroupWalletCommand } from "./commands/groupWallet.js";
 import { createPolicyCommand } from "./commands/policy.js";
+import { createSpendCommand } from "./commands/spend.js";
 import { createInlineQueryHandler } from "./commands/inlineMode.js";
 import { executeSkillRequest } from "./commands/skillCommand.js";
 import {
@@ -266,6 +267,7 @@ export function createBot(deps: {
   });
   bot.command("groupwallet", createGroupWalletCommand(deps));
   bot.command("policy", createPolicyCommand(deps));
+  bot.command("spend", createSpendCommand(deps));
 
   bot.command("pair", async ctx => {
     if (!ctx.from || !ctx.chat) return;

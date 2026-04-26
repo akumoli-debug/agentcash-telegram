@@ -23,6 +23,7 @@ import {
   runSkillCommand
 } from "./core/commandHandlers.js";
 import type { AppDatabase } from "./db/client.js";
+import { SpendAnalyticsService } from "./analytics/SpendAnalyticsService.js";
 import { hashSensitiveValue } from "./lib/crypto.js";
 import { QuoteError, ValidationError } from "./lib/errors.js";
 import type { AppLogger } from "./lib/logger.js";
@@ -168,6 +169,13 @@ export function buildDiscordCommandPayload(): unknown[] {
       )
       .addSubcommandGroup(group =>
         group
+          .setName("spend")
+          .setDescription("User wallet spend analytics")
+          .addSubcommand(sub => sub.setName("today").setDescription("Today's spend summary"))
+          .addSubcommand(sub => sub.setName("week").setDescription("Last 7 days spend summary"))
+      )
+      .addSubcommandGroup(group =>
+        group
           .setName("guild")
           .setDescription("Experimental Discord guild wallet")
           .addSubcommand(sub => sub.setName("create").setDescription("Create or show the guild wallet"))
@@ -194,6 +202,7 @@ export function buildDiscordCommandPayload(): unknown[] {
           .addSubcommand(sub => sub.setName("history").setDescription("Show guild wallet history"))
           .addSubcommand(sub => sub.setName("policy").setDescription("Show guild wallet spend policy"))
           .addSubcommand(sub => sub.setName("sync-admins").setDescription("Sync Discord managers to guild wallet admins"))
+          .addSubcommand(sub => sub.setName("spend").setDescription("Guild spend analytics (admin only)"))
           .addSubcommand(sub =>
             sub
               .setName("research")
@@ -486,6 +495,54 @@ export async function handleSlashCommand(interaction: ChatInputCommandInteractio
     return;
   }
 
+  if (group === "spend") {
+    const discordId = `discord:${interaction.user.id}`;
+    const user = deps.db.getUserByTelegramId(discordId);
+    const wallet = user ? deps.db.getWalletByUserId(user.id) : undefined;
+    const analytics = new SpendAnalyticsService(deps.db);
+
+    if (!wallet) {
+      await replyToInteraction(interaction, "No wallet found. Use /ac wallet balance to set one up.", true);
+      return;
+    }
+
+    if (subcommand === "today") {
+      const summary = analytics.getWalletSummary(wallet.id, 1);
+      const lines = [
+        "Today's spend",
+        `Today: $${(summary.totalCentsToday / 100).toFixed(4)}`
+      ];
+      if (summary.bySkill.length > 0) {
+        lines.push("", "By skill:");
+        for (const row of summary.bySkill) {
+          lines.push(`  ${row.skill}  $${(row.cents / 100).toFixed(4)}  ${row.count} call${row.count === 1 ? "" : "s"}`);
+        }
+      }
+      await replyToInteraction(interaction, lines.join("\n"), true);
+      return;
+    }
+
+    if (subcommand === "week") {
+      const summary = analytics.getWalletSummary(wallet.id, 7);
+      const lines = [
+        "Spend last 7 days",
+        `Today:       $${(summary.totalCentsToday / 100).toFixed(4)}`,
+        `Last 7 days: $${(summary.totalCentsLast7Days / 100).toFixed(4)}`
+      ];
+      if (summary.bySkill.length > 0) {
+        lines.push("", "By skill:");
+        for (const row of summary.bySkill) {
+          lines.push(`  ${row.skill}  $${(row.cents / 100).toFixed(4)}  ${row.count} call${row.count === 1 ? "" : "s"}`);
+        }
+      }
+      await replyToInteraction(interaction, lines.join("\n"), true);
+      return;
+    }
+
+    await replyToInteraction(interaction, "Unknown spend subcommand.", true);
+    return;
+  }
+
   if (group === "guild") {
     await handleGuildCommand(interaction, deps, subcommand, ctx);
     return;
@@ -664,6 +721,18 @@ async function handleGuildCommand(
     await replyToInteraction(
       interaction,
       `Guild wallet admin sync complete. Promoted: ${result.promoted}. Demoted: ${result.demoted}.`,
+      true
+    );
+    return;
+  }
+
+  if (subcommand === "spend") {
+    assertDiscordGuildAdmin(interaction);
+    const analytics = new SpendAnalyticsService(deps.db);
+    const summary = analytics.getGroupSummary(context.group.id, context.group.wallet_id, 30);
+    await replyToInteraction(
+      interaction,
+      analytics.formatWalletSummaryText(summary, "Guild spend"),
       true
     );
     return;

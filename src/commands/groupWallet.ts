@@ -12,6 +12,7 @@ import {
 import { WalletManager } from "../wallets/walletManager.js";
 import { formatUsdAmount, getCommandArgument } from "./helpers.js";
 import { replyWithError } from "./replyWithError.js";
+import { SpendAnalyticsService } from "../analytics/SpendAnalyticsService.js";
 
 const amountSchema = z.coerce.number().positive();
 
@@ -298,6 +299,63 @@ export function createGroupWalletCommand(deps: {
         return;
       }
 
+      if (subcommand === "spend") {
+        const isAdmin = deps.walletManager.isGroupAdmin(groupContext.group.id, groupContext.user.id);
+        const analytics = new SpendAnalyticsService(deps.db);
+        const subArg = rest[0] ?? "";
+
+        if (subArg === "users") {
+          if (!isAdmin) {
+            await ctx.reply("Only group wallet admins can view per-user spend breakdown.");
+            return;
+          }
+          const summary = analytics.getGroupSummary(groupContext.group.id, groupContext.wallet.id, 30);
+          await ctx.reply(analytics.formatGroupMemberText(summary, "Group spend by user"));
+          return;
+        }
+
+        if (subArg === "skills") {
+          const summary = analytics.getGroupSummary(groupContext.group.id, groupContext.wallet.id, 30);
+          await ctx.reply(analytics.formatSkillsText(summary, "Group spend by skill"));
+          return;
+        }
+
+        // Default group spend overview (admin sees full detail, members see aggregate)
+        const summary = analytics.getGroupSummary(groupContext.group.id, groupContext.wallet.id, 30);
+        if (isAdmin) {
+          await ctx.reply(analytics.formatWalletSummaryText(summary, "Group spend"));
+        } else {
+          const lines = [
+            "Group spend (30 days)",
+            `Today:         $${(summary.totalCentsToday / 100).toFixed(4)}`,
+            `Last 7 days:   $${(summary.totalCentsLast7Days / 100).toFixed(4)}`,
+            `Last 30 days:  $${(summary.totalCentsLast30Days / 100).toFixed(4)}`
+          ];
+          await ctx.reply(lines.join("\n"));
+        }
+        return;
+      }
+
+      if (subcommand === "export") {
+        await assertInternalAndFreshTelegramAdmin(ctx, deps, groupContext.group, groupContext.user, chatId);
+        const analytics = new SpendAnalyticsService(deps.db);
+        const rows = analytics.getGroupExportRows(groupContext.group.id, 30);
+        const csv = analytics.formatExportCsv(rows);
+        if (csv.length > 3800) {
+          await ctx.reply(
+            `Last 30 days — ${rows.length} rows\n\n` +
+            `<pre>${csv.slice(0, 3700)}\n…(truncated, use the export script for full data)</pre>`,
+            { parse_mode: "HTML" }
+          );
+        } else {
+          await ctx.reply(
+            `Last 30 days — ${rows.length} rows\n\n<pre>${csv}</pre>`,
+            { parse_mode: "HTML" }
+          );
+        }
+        return;
+      }
+
       await replyWithGroupWalletHelp(ctx);
     } catch (error) {
       await replyWithError(ctx, error);
@@ -318,6 +376,10 @@ async function replyWithGroupWalletHelp(ctx: Context): Promise<void> {
       "/groupwallet cap <amount>",
       "/groupwallet policy",
       "/groupwallet dailycap <amount|off>",
+      "/groupwallet spend",
+      "/groupwallet spend users",
+      "/groupwallet spend skills",
+      "/groupwallet export",
       "/groupwallet help"
     ].join("\n")
   );

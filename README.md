@@ -96,6 +96,7 @@ More diagrams:
 | Policy engine | Every quote passes through `PolicyEngine` which evaluates frozen-wallet, skill allowlist, daily/weekly caps, hard cap, trusted-skill auto-approve, first-spend, per-call cap, and high-cost threshold in that order. The policy state is snapshotted immutably in `policy_decisions` for each quote. See [docs/policy-engine.md](docs/policy-engine.md). |
 | Freeze controls | Users can freeze their own wallet (`/policy freeze` or `/freeze`). Telegram group admins and Discord guild managers can freeze shared wallets. Frozen wallets cannot create quotes or execute paid calls; balance, deposit, and history still work. |
 | Audit | Quote, transaction, admin, wallet, inline, replay, and execution events are recorded in `audit_events`. If `AUDIT_SINK=file` or `http`, an outbox worker ships sanitized copies to the configured sink and marks rows shipped. |
+| Spend analytics | `/spend` (private) and `/groupwallet spend` (group admin) provide live breakdowns by time period, skill, actor, and endpoint. Derived from existing audit tables — no raw request content is exposed. Export via `/spend export` or `scripts/export-spend.ts`. See [docs/usage-insights.md](docs/usage-insights.md). |
 
 ## Supported Platforms
 
@@ -131,6 +132,11 @@ More diagrams:
 | `/policy weeklycap <amount\|off>` | private | stable MVP |
 | `/policy allow-skill <skill>` | private | stable MVP |
 | `/policy block-skill <skill>` | private | stable MVP |
+| `/spend` | private | stable MVP |
+| `/spend today` | private | stable MVP |
+| `/spend week` | private | stable MVP |
+| `/spend skills` | private | stable MVP |
+| `/spend export` | private | stable MVP |
 | `/groupwallet create` | group/supergroup | experimental |
 | `/groupwallet sync-admins` | group/supergroup | experimental |
 | `/groupwallet roles` | group/supergroup | experimental |
@@ -138,6 +144,10 @@ More diagrams:
 | `/groupwallet deposit` | group/supergroup | experimental |
 | `/groupwallet history` | group/supergroup | experimental |
 | `/groupwallet cap [show\|off\|amount]` | group/supergroup | experimental |
+| `/groupwallet spend` | group/supergroup | experimental |
+| `/groupwallet spend users` | group/supergroup (admin) | experimental |
+| `/groupwallet spend skills` | group/supergroup | experimental |
+| `/groupwallet export` | group/supergroup (admin) | experimental |
 
 ### Discord
 
@@ -161,6 +171,9 @@ More diagrams:
 | `/ac guild freeze` | guild only | experimental |
 | `/ac guild unfreeze` | guild only | experimental |
 | `/ac guild status` | guild only | experimental |
+| `/ac spend today` | DM/guild, user wallet | experimental |
+| `/ac spend week` | DM/guild, user wallet | experimental |
+| `/ac guild spend` | guild only (admin) | experimental |
 
 ## Setup
 
