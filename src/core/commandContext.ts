@@ -18,11 +18,7 @@ export interface CommandContext {
   guildIdHash?: string;
   channelIdHash?: string;
   walletScope: WalletScope;
-  actorProfile?: {
-    username?: string | null;
-    firstName?: string | null;
-    lastName?: string | null;
-  };
+  actorProfile?: Record<string, never>;
   messageId?: string | null;
   reply(message: string): Promise<void>;
   replyPrivateOrEphemeral(message: string): Promise<void>;

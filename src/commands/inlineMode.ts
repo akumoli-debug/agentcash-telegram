@@ -76,6 +76,10 @@ export function parseInlineQuery(raw: string): ParsedInlineQuery {
     return { type: "help", reason: "ambiguous" };
   }
 
+  if (skill === "enrich" && !isEmailLike(input)) {
+    return { type: "help", reason: "ambiguous" };
+  }
+
   return {
     type: "intent",
     skill,
@@ -118,7 +122,7 @@ export function buildHelpArticle(reason: InlineHelpIntent["reason"]): InlineQuer
   const text =
     reason === "empty"
       ? "Examples: research x402 adoption, enrich jane@example.com, generate neon wallet icon"
-      : "Use research <query>, enrich <email/domain/person>, or generate <prompt>.";
+      : "Use research <query>, enrich <email>, or generate <prompt>.";
 
   return {
     type: "article",
@@ -141,6 +145,10 @@ function sanitizeInlineInput(input: string): string {
 
 function summarize(input: string): string {
   return input.length > 48 ? `${input.slice(0, 45)}...` : input;
+}
+
+function isEmailLike(input: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input);
 }
 
 function capitalize(value: string): string {

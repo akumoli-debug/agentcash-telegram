@@ -8,11 +8,7 @@ import { defaultLockManager, type LockManager } from "../lib/lockManager.js";
 
 const WALLET_LOCK_TTL_MS = 120_000;
 
-export interface TelegramProfile {
-  username?: string | null;
-  firstName?: string | null;
-  lastName?: string | null;
-}
+export type TelegramProfile = Record<string, never>;
 
 export interface WalletContextResult {
   user: UserRow;

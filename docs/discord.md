@@ -1,5 +1,7 @@
 # Discord MVP
 
+**Roadmap / experimental. Not part of the shipped Telegram private-chat MVP demo.**
+
 The Discord port is a thin adapter over the shared command layer. It does not copy Telegram command business logic.
 
 ## Architecture

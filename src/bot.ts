@@ -22,6 +22,7 @@ import {
   ensureUserRecord,
   confirmationKeyboard,
   getCallbackData,
+  getTelegramProfile,
   parseSessionQuoteState,
   replyWithSkillResult
 } from "./commands/helpers.js";
@@ -179,13 +180,28 @@ export function createBot(deps: {
         return;
       }
 
+      if (quote) {
+        const userHash = hashTelegramId(telegramId, deps.config.MASTER_ENCRYPTION_KEY);
+        const isRequester = quote.user_hash === userHash;
+        const isGroupAdmin =
+          quote.group_id !== null && deps.walletManager.isGroupAdmin(quote.group_id, user.id);
+
+        if (!isRequester && !isGroupAdmin) {
+          await ctx.answerCbQuery("This confirmation does not belong to your account.");
+          return;
+        }
+      }
+
+      const stateJson = session?.state_json ?? "";
+      const consumed = deps.db.consumeSessionState(sessionUserId, chatId, stateJson);
+      if (!consumed) {
+        await ctx.answerCbQuery("This confirmation was already used.");
+        return;
+      }
+
       const result = await deps.skillExecutor.executeApprovedQuote(quoteId, {
         telegramId,
-        telegramProfile: {
-          username: ctx.from?.username ?? null,
-          firstName: ctx.from?.first_name ?? null,
-          lastName: ctx.from?.last_name ?? null
-        },
+        telegramProfile: getTelegramProfile(ctx),
         telegramChatId: chatId,
         telegramChatType: ctx.chat?.type,
         telegramMessageId:
@@ -194,8 +210,6 @@ export function createBot(deps: {
             : null
       });
 
-      const stateJson = session?.state_json ?? "";
-      deps.db.consumeSessionState(sessionUserId, chatId, stateJson);
       await ctx.answerCbQuery("Confirmed.");
       await replyWithSkillResult(ctx, result);
     } catch (error) {

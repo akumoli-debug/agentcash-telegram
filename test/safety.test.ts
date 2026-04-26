@@ -381,6 +381,40 @@ describe("Phase 5 - Concurrent /start creates one wallet", () => {
     expect(wallets).toHaveLength(1);
     expect(callCount).toBe(1);
   });
+
+  it("does not store Telegram username or name fields going forward", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+
+    const config = makeConfig();
+    const ac = makeAgentCashClient();
+    const { WalletManager: WM } = await import("../src/wallets/walletManager.js");
+    const { createStartCommand } = await import("../src/commands/start.js");
+    const wm = new WM(db, config, ac);
+    const handler = createStartCommand({
+      config,
+      db,
+      walletManager: wm,
+      skillExecutor: {} as SkillExecutor
+    });
+
+    await handler({
+      from: {
+        id: 12345,
+        username: "raw_username",
+        first_name: "RawFirst",
+        last_name: "RawLast"
+      },
+      chat: { id: 12345, type: "private" },
+      message: { text: "/start", message_id: 1 },
+      reply: vi.fn()
+    } as never);
+
+    const user = db.getUserByTelegramId("12345")!;
+    expect(user.username).toBeNull();
+    expect(user.first_name).toBeNull();
+    expect(user.last_name).toBeNull();
+  });
 });
 
 describe("Phase 4 - Cap exceeded logging", () => {
@@ -422,6 +456,46 @@ describe("Phase 4 - Cap exceeded logging", () => {
 
     const preflights = db.sqlite.prepare("SELECT * FROM preflight_attempts WHERE failure_stage = 'balance'").all();
     expect(preflights).toHaveLength(1);
+  });
+
+  it("/cap rejects values above the hard cap", async () => {
+    const { runCapCommand } = await import("../src/core/commandHandlers.js");
+    const updateUserCap = vi.fn();
+    const replies: string[] = [];
+
+    await expect(
+      runCapCommand(
+        {
+          platform: "telegram",
+          actorIdHash: "actor-hash",
+          walletScope: {
+            kind: "user",
+            walletOwnerId: "12345",
+            chatId: "12345",
+            chatType: "private"
+          },
+          reply: async message => {
+            replies.push(message);
+          },
+          replyPrivateOrEphemeral: async message => {
+            replies.push(message);
+          },
+          confirm: async () => {}
+        },
+        {
+          config: makeConfig({ HARD_SPEND_CAP_USDC: 5, ALLOW_HIGH_VALUE_CALLS: false }),
+          db,
+          walletManager: {
+            updateUserCap,
+            getSpendCap: vi.fn().mockReturnValue(0.5)
+          } as unknown as WalletManager,
+          skillExecutor: {} as SkillExecutor
+        },
+        "10"
+      )
+    ).rejects.toThrow("caps above $5.00 are disabled");
+
+    expect(updateUserCap).not.toHaveBeenCalled();
   });
 });
 
@@ -474,7 +548,9 @@ describe("Phase 9 - /history returns sanitized data", () => {
       skill: "research",
       status: "success",
       quotedPriceUsdc: 0.01,
-      actualCostCents: 1
+      actualCostCents: 1,
+      requestHash: "abcd1234efgh5678",
+      requestSummary: "raw email jane@example.com should not display"
     });
 
     const entries = db.getHistoryForUser(userHash);
@@ -486,6 +562,61 @@ describe("Phase 9 - /history returns sanitized data", () => {
     expect(entryJson).not.toContain("12345");
     expect(entryJson).not.toContain("username");
     expect(entryJson).not.toContain("first_name");
+    expect(entryJson).not.toContain("jane@example.com");
+    expect(entryJson).toContain("abcd1234efgh5678");
+  });
+
+  it("/history replies with sanitized rows and short request hashes", async () => {
+    const { hashTelegramId } = await import("../src/lib/crypto.js");
+    const { runHistoryCommand } = await import("../src/core/commandHandlers.js");
+    const userHash = hashTelegramId("12345", MASTER_KEY);
+    const replies: string[] = [];
+
+    db.createTransaction({
+      userId: "usr_test",
+      walletId: "wal_test",
+      telegramChatId: userHash,
+      telegramIdHash: userHash,
+      commandName: "enrich",
+      skill: "enrich",
+      status: "success",
+      quotedPriceUsdc: 0.02,
+      actualCostCents: 2,
+      requestHash: "abcdef7890abcdef",
+      requestSummary: "jane@example.com"
+    });
+
+    await runHistoryCommand(
+      {
+        platform: "telegram",
+        actorIdHash: userHash,
+        walletScope: {
+          kind: "user",
+          walletOwnerId: "12345",
+          chatId: "12345",
+          chatType: "private"
+        },
+        reply: async message => {
+          replies.push(message);
+        },
+        replyPrivateOrEphemeral: async message => {
+          replies.push(message);
+        },
+        confirm: async () => {}
+      },
+      {
+        config: makeConfig(),
+        db,
+        walletManager: {} as WalletManager,
+        skillExecutor: {} as SkillExecutor
+      }
+    );
+
+    expect(replies[0]).toContain("Your last transactions:");
+    expect(replies[0]).toContain("enrich");
+    expect(replies[0]).toContain("req:abcdef7890ab");
+    expect(replies[0]).not.toContain("jane@example.com");
+    expect(replies[0]).not.toContain("12345");
   });
 
   it("different users cannot see each other's history", async () => {

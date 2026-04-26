@@ -32,7 +32,7 @@ Before any confirmation or execution, a `quotes` record is created with:
 - `canonical_request_json` — stable JSON of the request body (sorted keys)
 - `request_hash` — HMAC of the canonical request
 - `quoted_cost_cents` — cost from AgentCash CLI check
-- `max_approved_cost_cents` — ceiling enforced at the DB layer
+- `max_approved_cost_cents` — approved quote ceiling stored with the quote for audit and execution policy checks
 - `status` — `pending → approved → executed` (or `expired / cancelled / failed`)
 - `expires_at` — immutable TTL set at creation
 - `requester_user_id` and optional `group_id` — durable requester and group context
@@ -51,9 +51,8 @@ If 0 rows are changed, the confirm is rejected (replay protection). Execution th
 ## Wallet isolation model
 
 - Each Telegram user gets a distinct AgentCash wallet context.
-- Each Telegram group wallet gets a distinct AgentCash wallet context using `wallets.kind='group'`.
 - Wallet home directories are named `<AGENTCASH_HOME_ROOT>/<user_hash>/` where `user_hash` is a keyed HMAC of the Telegram ID — never the raw Telegram ID.
-- Group wallet home directories are named with a keyed HMAC of the chat ID, not the raw chat ID.
+- Experimental roadmap group wallet home directories are named with a keyed HMAC of the chat ID, not the raw chat ID.
 - SQLite stores wallet metadata. Private key material is encrypted at rest with AES-256-GCM using `MASTER_ENCRYPTION_KEY`.
 - Wallet provisioning is idempotent: if the wallet row exists and is active, the CLI is not called again.
 - If a new encrypted key is returned from the CLI but a different key already exists in the database, provisioning refuses with an error rather than silently overwriting.
@@ -79,7 +78,7 @@ Product, payment, and audit tables (`wallets`, `transactions`, `quotes`, `prefli
 
 The only table that stores raw Telegram user IDs is `delivery_identities`, which maps `user_hash → telegram_user_id` for session/callback routing. This table is isolated from payment data.
 
-The `users` table stores `telegram_user_id` for session lookup but no personal name fields.
+The `users` table stores `telegram_user_id` for session lookup and has nullable legacy name columns, but current command paths do not populate usernames, first names, or last names.
 
 `telegram_chat_id` in `transactions` rows stores the hashed chat ID, not the raw value.
 
@@ -118,7 +117,6 @@ No raw request bodies or user input is logged.
 - Hard MVP ceiling: `$5.00` unless `ALLOW_HIGH_VALUE_CALLS=true`
 - Natural-language routed calls always require explicit confirmation regardless of cap.
 - Cap denials are logged in `preflight_attempts`.
-- In group chats, members may request calls under the group cap. Over-cap group calls require owner/admin confirmation.
 
 ---
 
@@ -133,18 +131,15 @@ No raw request bodies or user input is logged.
 
 - The `LockManager` interface serializes wallet provisioning, quote approval, and paid execution.
 - The default `LocalLockManager` is in-process only.
-- Group wallet provisioning uses a per-group in-memory lock.
 - SQL-level atomic approve prevents double-execution even under concurrent callbacks.
 - Session state stores only `quote_id`, not raw input. Confirm handler verifies the quote ID matches the session before proceeding.
-- Group confirmations authorize against the immutable quote's stored `group_id`, requester, and over-cap approval flag.
-- Inline start payloads are HMAC-signed, single-use, and expire after 5 minutes. They can only route into the normal quote/confirmation flow.
-- Discord slash commands use the same quote records and confirmation state as Telegram; wallet-sensitive Discord responses are ephemeral.
+- Group wallets, inline mode, and Discord are roadmap/experimental code paths and are not part of the shipped Telegram private-chat MVP demo.
 
 ---
 
-## Group custody risks
+## Roadmap group custody risks
 
-Group wallets concentrate shared funds under one bot-controlled wallet. Current safeguards:
+Group wallets are not part of the shipped private-chat MVP demo. If enabled later, they concentrate shared funds under one bot-controlled wallet. Current experimental safeguards:
 
 - Group wallet creation is idempotent and uses `wallets.kind='group'`.
 - Raw Telegram chat IDs are hashed in group records.

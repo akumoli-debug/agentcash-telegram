@@ -1,5 +1,7 @@
 # Architecture
 
+The shipped MVP demo scope is Telegram private chat only: wallet funding details, balance, caps, `/research`, `/enrich`, `/generate`, confirmation, and sanitized `/history`.
+
 ## Runtime
 
 - TypeScript
@@ -36,7 +38,7 @@
 ## Data Model
 
 ```
-users               — Telegram user ID for lookup, cap settings (no personal names)
+users               — Telegram user ID for lookup, cap settings (nullable legacy name columns are not populated)
 delivery_identities — user_hash → telegram_user_id (PII isolated here)
 wallets             — per-user wallet metadata, encrypted private key
 quotes              — immutable quote record per paid call attempt
@@ -48,7 +50,7 @@ audit_events        — structured sanitized audit trail
 inline_payloads     — signed short-lived inline start payloads
 ```
 
-Telegram group wallets are experimental and use `wallets.kind='group'`. Discord guild wallets are not enabled in the MVP.
+Telegram group wallets, Telegram inline mode, and Discord support are roadmap/experimental surfaces. They are not part of the shipped private-chat MVP demo.
 
 ## Paid command execution flow
 
@@ -106,7 +108,7 @@ Webhook mode requires `WEBHOOK_SECRET_TOKEN` and `WEBHOOK_DOMAIN`. SQLite remain
 | `transactions` | `user_hash` as `telegram_id_hash` and `telegram_chat_id` |
 | `preflight_attempts` | `user_hash` only |
 
-No usernames, first names, or last names are stored anywhere.
+Current command paths do not populate usernames, first names, or last names. The SQLite `users` table still contains nullable legacy columns for those values, so a production migration should remove or quarantine them explicitly.
 
 ## Privacy and logging
 

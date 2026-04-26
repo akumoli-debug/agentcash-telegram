@@ -118,6 +118,12 @@ describe("inline mode", () => {
     expect(db.sqlite.prepare("SELECT * FROM transactions").all()).toHaveLength(0);
   });
 
+  it("treats non-email enrich inline queries as help, not a paid preview", () => {
+    const parsed = parseInlineQuery("enrich example.com");
+
+    expect(parsed).toEqual({ type: "help", reason: "ambiguous" });
+  });
+
   it("rejects expired inline payloads", () => {
     db = new AppDatabase(":memory:");
     db.initialize();

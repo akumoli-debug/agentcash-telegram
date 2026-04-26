@@ -1,5 +1,7 @@
 # Group Wallets
 
+**Roadmap / experimental. Not part of the shipped Telegram private-chat MVP demo.**
+
 Group wallets are experimental support for Telegram groups. They reuse the existing `wallets` table with `kind='group'`; there is no second wallet system.
 
 ## Model

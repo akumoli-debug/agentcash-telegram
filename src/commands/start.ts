@@ -59,7 +59,7 @@ export function createStartCommand(deps: {
           `Deposit address: ${deposit.address ?? "unavailable"}`,
           deposit.depositLink ? `Deposit link: ${deposit.depositLink}` : "Deposit link: unavailable",
           "",
-          "Try /balance, /deposit, /research, /enrich, /generate, or /cap show."
+          "Try /balance, /deposit, /history, /research, /enrich, /generate, or /cap show."
         ].join("\n")
       );
     } catch (error) {

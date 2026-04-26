@@ -151,6 +151,7 @@ export interface HistoryEntry {
   status: string;
   quoted_price_usdc: number | null;
   actual_cost_cents: number | null;
+  request_hash: string | null;
   created_at: string;
   error_code: string | null;
   is_dev_unquoted: number | null;
@@ -1151,6 +1152,7 @@ export class AppDatabase {
             t.status,
             t.quoted_price_usdc,
             t.actual_cost_cents,
+            t.request_hash,
             t.created_at,
             t.error_code,
             q.is_dev_unquoted
@@ -1174,6 +1176,7 @@ export class AppDatabase {
             t.status,
             t.quoted_price_usdc,
             t.actual_cost_cents,
+            t.request_hash,
             t.created_at,
             t.error_code,
             q.is_dev_unquoted

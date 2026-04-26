@@ -1,5 +1,7 @@
 # Inline Mode
 
+**Roadmap / experimental. Not part of the shipped Telegram private-chat MVP demo.**
+
 Telegram inline mode is preview-first. Inline results never execute paid calls.
 
 ## Setup
@@ -54,4 +56,4 @@ When `/start <token>` is received, the bot verifies and consumes the payload, th
 
 - Telegram `/start` parameters are short, so the deep link contains a signed token rather than the full request payload.
 - Inline payloads are single-use and expire after 5 minutes.
-- `enrich` previews accept email/domain/person text, but the current paid enrichment endpoint may still reject inputs it cannot safely validate.
+- `enrich` previews currently accept email addresses only. Domain/person enrichment remains a roadmap item until the paid validator and endpoint contract support it end to end.

@@ -26,28 +26,26 @@ If any step fails, the call stops. Failed preflight attempts are logged in `pref
 
 ## Features
 
-- per-user AgentCash wallet isolation (hashed home directories)
-- `/start`, `/deposit`, `/balance`, `/history`
-- `/groupwallet create|deposit|balance|members|history|cap|help` (experimental)
-- Discord `/ac balance`, `/ac deposit`, `/ac research query:` (MVP, direct-message user wallets)
+- Telegram private-chat bot
+- `/start`, `/deposit`, `/balance`, `/cap`, `/history`
 - `/research`, `/enrich`, `/generate`
-- immutable quote records with replay protection
-- spending caps with a hard MVP safety ceiling
-- inline confirmation flow (quote-bound, not raw-input re-execution)
-- Docker/Compose deployment scaffold with health endpoint
-- sanitized structured audit events
-- preflight failure logging (quote failures, cap denials, replay attempts)
-- local `LockManager` implementation (prevents duplicate wallet provisioning and double execution in one process)
-- transaction history scoped by hashed user ID (no PII)
-- optional natural-language routing (always requires confirmation)
+- per-user AgentCash wallet isolation
+- spending caps with hard MVP safety ceiling
+- confirmation flow for over-cap or natural-language requests
+- transaction logging with request/response hashes
+- optional natural-language routing when model keys are configured
+- local SQLite storage
 
 ## Roadmap
 
-- group wallets (experimental: shipped for Telegram groups)
-- Discord port (MVP shipped: user-wallet slash commands)
-- inline query mode (shipped: preview-first)
-- hosted deployment scaffold (experimental; not production custody ready)
-- production database and distributed lock
+- Telegram group wallets
+- Telegram inline query mode
+- Discord port
+- production Postgres adapter
+- distributed lock
+- KMS/HSM custody model
+- key rotation
+- hosted deployment with production custody review
 
 ## Setup
 
@@ -72,9 +70,7 @@ corepack pnpm approve-builds
 
 ### 3. Create bot credentials
 
-For Telegram, create a bot with BotFather and copy the token.
-
-For Discord, create an app in the Discord Developer Portal and copy the bot token and application ID.
+Create a Telegram bot with BotFather and copy the token.
 
 ### 4. Configure environment variables
 
@@ -87,25 +83,16 @@ Put the generated value into `MASTER_ENCRYPTION_KEY`.
 
 Minimum required:
 
-- `TELEGRAM_BOT_TOKEN` or `DISCORD_BOT_TOKEN`
-- `DISCORD_APPLICATION_ID` if Discord is enabled
+- `TELEGRAM_BOT_TOKEN`
 - `MASTER_ENCRYPTION_KEY`
 
 Optional:
 
-- `TELEGRAM_BOT_USERNAME` — enables per-card inline deep-link buttons such as `https://t.me/<bot>?start=...`
-- `DISCORD_BOT_TOKEN` and `DISCORD_APPLICATION_ID` — enables the Discord MVP and slash command registration
 - `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` — enables natural-language routing
 - `BOT_MODE=webhook` plus webhook settings for hosted deployments
 - `ALLOW_UNQUOTED_DEV_CALLS=true` — local dev only: runs calls even if AgentCash CLI cannot quote them. Marks transactions as `dev_unquoted`. **Never use in production.**
 
 Webhook mode requires `WEBHOOK_DOMAIN` and `WEBHOOK_SECRET_TOKEN`.
-
-For Telegram inline mode, ask BotFather to enable inline queries:
-
-```text
-/setinline
-```
 
 ### 5. Run locally
 
@@ -124,17 +111,7 @@ corepack pnpm test
 
 ## Production Readiness
 
-Hosted deployment is scaffolded, not production-custody-ready.
-
-Included:
-
-- `Dockerfile`
-- `docker-compose.yml`
-- `/healthz` and `/readyz` health endpoint on `HEALTH_PORT`
-- webhook mode validation requiring `WEBHOOK_SECRET_TOKEN`
-- local `LockManager` abstraction
-- SQLite/Postgres adapter seam
-- custody review docs
+Hosted deployment is not production-custody-ready.
 
 Still not production custody:
 
@@ -152,12 +129,11 @@ Read [docs/deployment.md](docs/deployment.md) and [docs/custody-review.md](docs/
 1. `/start` — provisions wallet, shows deposit address
 2. `/deposit` — shows funding details
 3. `/balance` — balance and spend cap state
-4. `/research latest x402 ecosystem activity` — quoted, confirmed if above cap, executed
-5. `/enrich jane@example.com` — same flow
-6. `/generate lobster wearing a tuxedo` — image generation with optional job polling
-7. `/history` — shows last 10 transactions (sanitized, no PII)
-8. Inline mode: type `@your_bot research latest x402 ecosystem activity` in any chat, choose the preview, then open the bot to estimate and confirm before spending
-9. Discord DM: `/ac balance`, `/ac deposit`, `/ac research query:latest x402 ecosystem activity`
+4. `/cap 0.25` — set the per-call confirmation cap
+5. `/research latest x402 ecosystem activity` — quoted, confirmed if above cap, executed
+6. `/enrich jane@example.com` — same flow
+7. `/generate lobster wearing a tuxedo` — image generation with optional job polling
+8. `/history` — sanitized transaction history with costs and request hashes
 
 ## Architecture
 
@@ -194,7 +170,7 @@ See [docs/security.md](docs/security.md) for the full, honest posture.
 Key points:
 - Telegram IDs are hashed (HMAC-SHA256) before storage in payment/audit tables
 - Private keys are encrypted at rest (AES-256-GCM) with `MASTER_ENCRYPTION_KEY`
-- No username or name fields stored in product tables
+- Current command paths do not store usernames or personal names in payment/audit tables; the local `users` schema still has nullable legacy name columns that should be removed in a production migration
 - Quote records are immutable and replay-protected at the SQL level
 - AgentCash CLI dependency is a known risk: it runs as a subprocess and must be trusted
 - SQLite is local-only and not suitable for distributed production

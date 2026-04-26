@@ -241,6 +241,7 @@ function formatHistoryEntry(entry: HistoryEntry, index: number): string {
   const devTag = entry.is_dev_unquoted ? " [dev]" : "";
   const errTag = entry.error_code ? ` (${entry.error_code})` : "";
   const statusLabel = status === "success" ? "✓" : status === "error" ? "✗" : status;
+  const requestHash = entry.request_hash ? `  req:${entry.request_hash.slice(0, 12)}` : "";
 
-  return `${index + 1}. ${skill}  ${statusLabel}  ${cost}  ${date}${devTag}${errTag}`;
+  return `${index + 1}. ${skill}  ${statusLabel}  ${cost}  ${date}${requestHash}${devTag}${errTag}`;
 }

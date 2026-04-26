@@ -29,11 +29,8 @@ export function getCommandArgument(ctx: Context): string {
 }
 
 export function getTelegramProfile(ctx: Context): TelegramProfile {
-  return {
-    username: ctx.from?.username ?? null,
-    firstName: ctx.from?.first_name ?? null,
-    lastName: ctx.from?.last_name ?? null
-  };
+  void ctx;
+  return {};
 }
 
 export function getExecutionContext(ctx: Context): SkillExecutionContext {
