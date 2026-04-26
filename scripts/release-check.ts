@@ -124,7 +124,6 @@ function checkReadme(root: string, failures: string[]): void {
   const requiredSections = [
     "## Competitive Context",
     "## Why This Exists",
-    "## Demo",
     "## Feature Status",
     "## Implementation Evidence",
     "## Payment Safety Model",
@@ -165,7 +164,6 @@ function checkRequiredDocs(root: string, failures: string[]): void {
     "docs/custody-review.md",
     "docs/security.md",
     "docs/deployment.md",
-    "docs/demo-script.md",
     "docs/evaluator-guide.md",
     "docs/release-checklist.md",
     "docs/diagrams/architecture.mmd",

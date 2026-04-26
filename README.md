@@ -21,10 +21,6 @@ Hermes is a broad agent gateway. AgentCash as a Hermes skill proves demand for p
 
 CoWork-OS is a broad personal AI OS with wallet/x402 features. This repo is narrower and deeper for AgentCash spend governance. It does not try to replace a personal AI OS; it tries to make AgentCash/x402 spend legible, controlled, and reviewable for users and teams.
 
-## Demo
-
-Use [docs/demo-script.md](docs/demo-script.md) for exact talk tracks and commands.
-
 ## Feature Status
 
 | Feature | Status | Notes |

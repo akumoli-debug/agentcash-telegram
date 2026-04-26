@@ -46,7 +46,6 @@ const requiredEnvVars = [
 const requiredReadmeSections = [
   "## Competitive Context",
   "## Why This Exists",
-  "## Demo",
   "## Feature Status",
   "## Implementation Evidence",
   "## Payment Safety Model",
@@ -70,7 +69,6 @@ const requiredDocs = [
   "docs/custody-review.md",
   "docs/security.md",
   "docs/deployment.md",
-  "docs/demo-script.md",
   "docs/evaluator-guide.md",
   "docs/release-checklist.md",
   "docs/diagrams/architecture.mmd",

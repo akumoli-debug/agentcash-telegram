@@ -11,7 +11,6 @@ Use this before tagging or presenting the repository as a v0.1 release package.
 - [ ] `.env.example` is complete and uses placeholders.
 - [ ] README status table is accurate.
 - [ ] Limitations and custody sections are accurate.
-- [ ] Demo video/GIF/Loom is recorded or explicitly left as a placeholder.
 
 ## Validation
 
