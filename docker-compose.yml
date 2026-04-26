@@ -1,53 +1,17 @@
-services:
-  app:
-    build:
-      context: .
-    env_file:
-      - .env
-    environment:
-      NODE_ENV: production
-      DATABASE_PROVIDER: sqlite
-      DATABASE_PATH: /app/.data/agentcash-telegram.db
-      ALLOW_SQLITE_IN_PRODUCTION: "true"
-      DATABASE_URL: postgres://agentcash:agentcash@postgres:5432/agentcash
-      LOCK_PROVIDER: redis
-      REDIS_URL: redis://redis:6379
-      AUDIT_SINK: file
-      AUDIT_FILE_PATH: /app/.data/audit-events.jsonl
-      AGENTCASH_HOME_ROOT: /app/data/agentcash-homes
-      HEALTH_HOST: 0.0.0.0
-      HEALTH_PORT: 3001
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    ports:
-      - "3000:3000"
-      - "3001:3001"
-    volumes:
-      - agentcash-data:/app/.data
-      - agentcash-homes:/app/data/agentcash-homes
-    restart: unless-stopped
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:3001/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-        ]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
+# Scaffold-only compose file for local dependency experiments.
+# The application runtime is intentionally not defined here.
+# Use docker-compose.demo.yml for the local demo app.
 
+services:
   postgres:
     image: postgres:16-alpine
+    profiles: ["postgres-scaffold"]
     environment:
       POSTGRES_DB: agentcash
       POSTGRES_USER: agentcash
       POSTGRES_PASSWORD: agentcash
+    ports:
+      - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -56,25 +20,5 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  audit-sink-mock:
-    image: mendhak/http-https-echo:35
-    profiles: ["audit-mock"]
-    ports:
-      - "8080:8080"
-
 volumes:
-  agentcash-data:
-  agentcash-homes:
   postgres-data:
-  redis-data:

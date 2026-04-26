@@ -1,6 +1,6 @@
 # Deployment
 
-This app can be deployed for demos and staging-like operation. It is not production-custody-safe.
+This repo is demo-oriented. The Docker files are useful for local demos and dependency scaffolding, but they are not a production custody deployment.
 
 ## Local Dev
 
@@ -17,49 +17,102 @@ Use SQLite and local locks for local dev:
 DATABASE_PROVIDER=sqlite
 LOCK_PROVIDER=local
 AUDIT_SINK=database
+AUDIT_STRICT_MODE=false
 NODE_ENV=development
 ```
 
-## Staging
+## Demo Compose
 
-Use the same config shape as production, but keep balances small and caps low:
-
-```bash
-NODE_ENV=production
-DATABASE_PROVIDER=sqlite
-ALLOW_SQLITE_IN_PRODUCTION=true
-LOCK_PROVIDER=redis
-REDIS_URL=redis://redis:6379
-AUDIT_SINK=file
-HARD_SPEND_CAP_USDC=1
-SKIP_AGENTCASH_HEALTHCHECK=false
-ALLOW_UNQUOTED_DEV_CALLS=false
-```
-
-The compose file includes Postgres and Redis. The app still uses SQLite by explicit override because the Postgres repository layer is not fully wired yet. Postgres migrations can be tested with `corepack pnpm db:migrate`.
-
-## Production-Like Compose
+The demo compose file runs the app with SQLite, local locks, file audit logs, and demo/local custody. It sets `NODE_ENV=development` and does not use `ALLOW_SQLITE_IN_PRODUCTION`.
 
 ```bash
 cp .env.example .env
-docker compose up --build
+docker compose -f docker-compose.demo.yml up --build
+```
+
+This mode proves:
+
+- the container image builds
+- the app can boot with SQLite
+- `/readyz` can check the local database, lock provider, custody health setting, and platform config
+- `/healthz` remains available as process liveness only
+
+This mode does not prove:
+
+- production database readiness
+- multi-instance safety
+- remote signer/KMS custody
+- production-grade immutable audit storage
+- funded live AgentCash behavior when `SKIP_AGENTCASH_HEALTHCHECK=true`
+
+The demo compose defaults `SKIP_AGENTCASH_HEALTHCHECK=true` so the container can boot without a configured AgentCash CLI or funded wallet. If you set it to `false`, `/readyz` and startup depend on AgentCash CLI health.
+
+Health endpoints:
+
+```bash
 curl http://localhost:3001/healthz
 curl http://localhost:3001/readyz
 curl http://localhost:3001/metrics
 ```
 
-Services:
+`/healthz` only proves the process is alive. The compose healthcheck uses `/readyz` because readiness includes dependency checks.
 
-- `app`
-- `postgres`
-- `redis`
-- optional `audit-sink-mock` profile
-
-Audit sink mock:
+Optional audit sink mock:
 
 ```bash
-docker compose --profile audit-mock up --build
+docker compose -f docker-compose.demo.yml --profile audit-mock up --build
 ```
+
+## Postgres Scaffold
+
+Postgres is not included in the demo app compose path because the runtime repository still uses SQLite. Postgres is a migration scaffold and future production DB target only; the runtime adapter is not implemented.
+
+To start a local Postgres service for migration scaffolding only:
+
+```bash
+docker compose --profile postgres-scaffold up
+```
+
+What this proves:
+
+- a local Postgres container can start
+- migrations can be tested separately with `corepack pnpm db:migrate`
+
+What it does not prove:
+
+- the live app uses Postgres as its runtime repository
+- production storage is complete
+- SQLite has been replaced for bot command execution
+
+Migration test example:
+
+```bash
+DATABASE_PROVIDER=postgres \
+DATABASE_URL=postgres://agentcash:agentcash@localhost:5432/agentcash \
+corepack pnpm db:migrate
+```
+
+## Production Skeleton
+
+`docker-compose.prod-skeleton.yml` documents the shape of a future production deployment. It is intentionally not a custody-ready compose file.
+
+```bash
+docker compose -f docker-compose.prod-skeleton.yml config
+```
+
+The skeleton requires production-shaped settings:
+
+- `DATABASE_PROVIDER=postgres`
+- managed `DATABASE_URL`
+- `LOCK_PROVIDER=redis`
+- managed `REDIS_URL`
+- `AUDIT_SINK=http`
+- external `AUDIT_HTTP_ENDPOINT`
+- `CUSTODY_MODE=remote_signer`
+- reviewed `REMOTE_SIGNER_URL`
+- pinned `AGENTCASH_ARGS`
+
+The skeleton does not prove production readiness. Today, app startup with `DATABASE_PROVIDER=postgres` fails before partially starting with: `Postgres runtime adapter is not implemented yet. Use SQLite for local demo or implement PostgresAdapter before production.` Remote signer/KMS custody is also not implemented as a reviewed production boundary.
 
 ## Required Secrets
 
@@ -70,6 +123,7 @@ docker compose --profile audit-mock up --build
 - `REDIS_URL` when `LOCK_PROVIDER=redis`
 - `DATABASE_URL` when `DATABASE_PROVIDER=postgres`
 - `AUDIT_HTTP_ENDPOINT` when `AUDIT_SINK=http`
+- `REMOTE_SIGNER_URL` when `CUSTODY_MODE=remote_signer`
 
 ## Telegram Webhook
 
@@ -104,13 +158,14 @@ Global Discord commands can take time to propagate.
 - Set secrets through the platform secret manager, not `.env` committed to git.
 - Expose the webhook port and health port according to the platform model.
 - Use managed Redis for `LOCK_PROVIDER=redis`.
-- Use managed Postgres only after the repository adapter is fully wired and tested.
+- Do not claim managed Postgres runtime support until the repository adapter is fully wired and tested.
 - Keep `AUDIT_SINK=file` or `AUDIT_SINK=http`; database-only audit is not enough for production.
+- Set `AUDIT_STRICT_MODE=true` when readiness should fail if external audit shipping is unhealthy.
 
 ## Operational Caveats
 
 - `/healthz` only proves the process is alive.
-- `/readyz` checks dependencies.
-- SQLite in production requires an explicit unsafe override and is not horizontally safe.
+- `/readyz` checks dependencies and is the correct readiness endpoint.
+- SQLite is demo/local only and not horizontally safe.
 - Redis locks do not replace DB idempotency.
 - Custody remains demo-only unless remote signer/KMS is completed and reviewed.

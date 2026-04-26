@@ -15,11 +15,13 @@ export interface ProductionConfigValues {
   ALLOW_VERBOSE_LOGS_IN_PRODUCTION: boolean;
   ALLOW_UNQUOTED_DEV_CALLS: boolean;
   SKIP_AGENTCASH_HEALTHCHECK: boolean;
+  AGENTCASH_ARGS: string;
   HARD_SPEND_CAP_USDC: number;
   MASTER_ENCRYPTION_KEY: string;
   TELEGRAM_BOT_TOKEN?: string;
   DISCORD_BOT_TOKEN?: string;
   AUDIT_SINK: "database" | "file" | "http";
+  AUDIT_STRICT_MODE: boolean;
   ALLOW_DATABASE_AUDIT_IN_PRODUCTION: boolean;
 }
 
@@ -83,6 +85,16 @@ export function validateProductionConfig(
   addIssueIf(ctx, values.SKIP_AGENTCASH_HEALTHCHECK, {
     message: "SKIP_AGENTCASH_HEALTHCHECK must be false in production",
     path: ["SKIP_AGENTCASH_HEALTHCHECK"]
+  });
+
+  addIssueIf(ctx, rawEnv.AGENTCASH_ARGS === undefined || rawEnv.AGENTCASH_ARGS === "", {
+    message: "AGENTCASH_ARGS must be explicitly set in production",
+    path: ["AGENTCASH_ARGS"]
+  });
+
+  addIssueIf(ctx, values.AGENTCASH_ARGS.includes("@latest"), {
+    message: "AGENTCASH_ARGS must pin a tested AgentCash CLI version in production",
+    path: ["AGENTCASH_ARGS"]
   });
 
   addIssueIf(ctx, rawEnv.HARD_SPEND_CAP_USDC === undefined || rawEnv.HARD_SPEND_CAP_USDC === "", {

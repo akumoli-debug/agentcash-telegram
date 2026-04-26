@@ -4,7 +4,12 @@ import { WalletManager } from "../wallets/walletManager.js";
 import type { AppConfig } from "../config.js";
 import type { SkillExecutor } from "../agentcash/skillExecutor.js";
 import { consumeSignedInlinePayload, isInlineStartPayload } from "../lib/inlinePayload.js";
-import { getCommandArgument, getExecutionContext } from "./helpers.js";
+import {
+  getCommandArgument,
+  getExecutionContext,
+  replyDmInstructionForUserWalletCommand,
+  isPrivateTelegramChat
+} from "./helpers.js";
 import { replyWithError } from "./replyWithError.js";
 import { executeSkillRequest } from "./skillCommand.js";
 
@@ -17,6 +22,11 @@ export function createStartCommand(deps: {
   return async (ctx: Context) => {
     try {
       const startPayload = getCommandArgument(ctx);
+      if (!isPrivateTelegramChat(ctx)) {
+        await replyDmInstructionForUserWalletCommand(ctx);
+        return;
+      }
+
       if (isInlineStartPayload(startPayload)) {
         const inlinePayload = consumeSignedInlinePayload(
           deps.db,

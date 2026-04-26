@@ -67,7 +67,7 @@ Terminal states:
 ## Remaining Risks
 
 - Redis lock renewal is not implemented.
-- If a process crashes after the paid call succeeds but before DB completion, the quote can remain `executing` and needs reconciliation.
+- If a process crashes after the paid call starts but before DB completion, the quote can remain `executing` until its execution lease expires. The reconciler marks it `succeeded` when a local transaction exists or `execution_unknown` when operator review is required.
 - Postgres repository wiring is not complete yet; SQLite cannot provide multi-instance production guarantees.
 - External payment APIs still need their own idempotency support where available.
-- Operators need monitoring for stuck `executing` quotes and repeated lock failures.
+- Operators need monitoring for `execution_unknown` quotes and repeated lock failures.

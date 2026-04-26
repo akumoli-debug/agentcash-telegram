@@ -1,4 +1,5 @@
 import { z } from "zod";
+import crypto from "node:crypto";
 import type { AppConfig } from "../config.js";
 import { AppDatabase, type GroupRow, type UserRow, type WalletRow } from "../db/client.js";
 import { hashSensitiveValue, hashTelegramId } from "../lib/crypto.js";
@@ -157,6 +158,18 @@ const skillDefinitions: Record<SkillName, SkillDefinition<string>> = {
 };
 
 const EXECUTION_LOCK_TTL_MS = 120_000;
+const EXECUTION_LEASE_TTL_MS = 120_000;
+
+export function makeUpstreamIdempotencyKey(input: {
+  quoteId: string;
+  walletId: string;
+  requestHash: string;
+}): string {
+  return `agentcash:${crypto
+    .createHash("sha256")
+    .update(`${input.quoteId}:${input.walletId}:${input.requestHash}`)
+    .digest("hex")}`;
+}
 
 export class SkillExecutor {
   constructor(
@@ -369,7 +382,36 @@ export class SkillExecutor {
         throw new QuoteError("This confirmation does not belong to your account.");
       }
 
+      if (!group && context.telegramChatType && context.telegramChatType !== "private") {
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: quote.wallet_id,
+          skill: quote.skill,
+          failureStage: "replay",
+          errorCode: "USER_QUOTE_CONFIRMED_FROM_GROUP",
+          safeErrorMessage: "User wallet quote confirmed from a non-private chat"
+        });
+        throw new QuoteError("Private wallet confirmations must be completed in a DM with the bot.");
+      }
+
       if (group) {
+        if (
+          group.platform === "telegram" &&
+          context.telegramChatType &&
+          context.telegramChatType !== "group" &&
+          context.telegramChatType !== "supergroup"
+        ) {
+          this.db.logPreflightAttempt({
+            userHash,
+            walletId: quote.wallet_id,
+            skill: quote.skill,
+            failureStage: "replay",
+            errorCode: "GROUP_QUOTE_CONFIRMED_OUTSIDE_GROUP",
+            safeErrorMessage: "Group quote confirmed outside a Telegram group"
+          });
+          throw new QuoteError("This group confirmation is no longer valid.");
+        }
+
         if (group.telegram_chat_id_hash !== chatHash) {
           this.db.logPreflightAttempt({
             userHash,
@@ -609,7 +651,16 @@ export class SkillExecutor {
       this.config.RATE_LIMIT_PAID_EXECUTION_MAX_PER_MINUTE
     );
 
-    if (!this.db.atomicBeginQuoteExecution(quoteId)) {
+    const upstreamIdempotencyKey =
+      quote.upstream_idempotency_key ??
+      makeUpstreamIdempotencyKey({
+        quoteId,
+        walletId: wallet.id,
+        requestHash: quote.request_hash
+      });
+    const leaseExpiresAt = new Date(Date.now() + EXECUTION_LEASE_TTL_MS).toISOString();
+
+    if (!this.db.atomicBeginQuoteExecution(quoteId, { leaseExpiresAt, upstreamIdempotencyKey })) {
       this.db.logPreflightAttempt({
         userHash,
         walletId: wallet.id,
@@ -623,25 +674,10 @@ export class SkillExecutor {
       throw new QuoteError("This confirmation was already used.");
     }
 
-    const transaction = this.db.createTransaction({
-      userId: requesterUserId,
-      walletId: wallet.id,
-      groupId: quote.group_id ?? null,
-      telegramChatId: userHash,
-      telegramIdHash: userHash,
-      commandName: skill.name,
-      skill: skill.name,
-      endpoint: skill.endpoint,
-      quoteId,
-      idempotencyKey: `quote:${quoteId}:execute`,
-      status: "submitted",
-      estimatedCostCents: quote.quoted_cost_cents,
-      quotedPriceUsdc: Number((quote.quoted_cost_cents / 100).toFixed(6)),
-      requestHash: quote.request_hash
-    }) as { id: string };
-
     try {
-      const fetchResult = await this.agentcashClient.fetchJson(wallet, skill.endpoint, requestBody);
+      const fetchResult = await this.agentcashClient.fetchJson(wallet, skill.endpoint, requestBody, {
+        idempotencyKey: upstreamIdempotencyKey
+      });
       const responseHash = hashSensitiveValue(
         JSON.stringify(fetchResult.data),
         this.config.MASTER_ENCRYPTION_KEY
@@ -651,12 +687,29 @@ export class SkillExecutor {
         wallet
       });
 
-      this.db.updateTransaction(transaction.id, {
+      const transaction = this.db.createTransaction({
+        userId: requesterUserId,
+        walletId: wallet.id,
+        groupId: quote.group_id ?? null,
+        telegramChatId: userHash,
+        telegramIdHash: userHash,
+        commandName: skill.name,
+        skill: skill.name,
+        endpoint: skill.endpoint,
+        quoteId,
+        idempotencyKey: upstreamIdempotencyKey,
         status: "success",
+        estimatedCostCents: quote.quoted_cost_cents,
+        quotedPriceUsdc: Number((quote.quoted_cost_cents / 100).toFixed(6)),
         actualCostCents: fetchResult.actualCostCents ?? null,
+        actualPriceUsdc:
+          fetchResult.actualCostCents === undefined
+            ? null
+            : Number((fetchResult.actualCostCents / 100).toFixed(6)),
+        requestHash: quote.request_hash,
         responseHash,
         txHash: fetchResult.txHash ?? null
-      });
+      }) as { id: string };
 
       this.db.transitionQuoteStatus(quoteId, "executing", "succeeded", {
         executedAt: new Date().toISOString(),
@@ -690,18 +743,11 @@ export class SkillExecutor {
         error instanceof Error
           ? hashSensitiveValue(error.message, this.config.MASTER_ENCRYPTION_KEY)
           : undefined;
+      const safeError = safeExecutionErrorMessage(error);
 
-      this.db.updateTransaction(transaction.id, {
-        status: "error",
-        responseHash,
-        errorCode:
-          error instanceof Error && "code" in error
-            ? String((error as { code?: string }).code ?? "UNKNOWN")
-            : "UNKNOWN",
-        errorMessage: error instanceof Error ? error.message : "Unknown error"
+      this.db.transitionQuoteStatus(quoteId, "executing", "execution_unknown", {
+        lastExecutionError: safeError
       });
-
-      this.db.transitionQuoteStatus(quoteId, "executing", "failed");
 
       this.logger.warn(
         {
@@ -712,9 +758,10 @@ export class SkillExecutor {
           requestHash: quote.request_hash,
           responseHash,
           quotedCostCents: quote.quoted_cost_cents,
-          status: "error"
+          upstreamIdempotencyKey,
+          status: "execution_unknown"
         },
-        "skill execution failed"
+        "skill execution became ambiguous and requires reconciliation"
       );
 
       this.db.logPreflightAttempt({
@@ -728,7 +775,7 @@ export class SkillExecutor {
           error instanceof Error && "code" in error
             ? String((error as { code?: string }).code ?? "EXEC_ERROR")
             : "EXEC_ERROR",
-        safeErrorMessage: "Skill execution failed after approval"
+        safeErrorMessage: safeError
       });
 
       throw error instanceof Error
@@ -788,6 +835,15 @@ export class SkillExecutor {
 
     throw new SpendingCapError("This group wallet has reached its daily spend cap.");
   }
+}
+
+function safeExecutionErrorMessage(error: unknown): string {
+  const code =
+    error instanceof Error && "code" in error
+      ? String((error as { code?: string }).code ?? "UNKNOWN")
+      : "UNKNOWN";
+  const name = error instanceof Error ? error.name : "UnknownError";
+  return `Execution outcome is unknown after upstream call started; operator reconciliation required (${name}:${code}).`;
 }
 
 /**

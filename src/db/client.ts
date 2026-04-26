@@ -69,12 +69,27 @@ export interface QuoteRow {
   quoted_cost_cents: number;
   max_approved_cost_cents: number;
   is_dev_unquoted: number;
-  status: "pending" | "approved" | "executing" | "succeeded" | "expired" | "canceled" | "failed";
+  status:
+    | "pending"
+    | "approved"
+    | "executing"
+    | "succeeded"
+    | "expired"
+    | "canceled"
+    | "failed"
+    | "execution_unknown";
   created_at: string;
   expires_at: string;
   approved_at: string | null;
   executed_at: string | null;
   transaction_id: string | null;
+  execution_started_at: string | null;
+  execution_lease_expires_at: string | null;
+  execution_attempt_count: number;
+  last_execution_error: string | null;
+  upstream_idempotency_key: string | null;
+  reconciliation_status: string | null;
+  reconciled_at: string | null;
   requester_user_id: string | null;
   group_id: string | null;
   requires_group_admin_approval: number;
@@ -227,6 +242,44 @@ export interface AuditEventInput {
   metadata?: Record<string, string | number | boolean | null>;
 }
 
+export interface BeginQuoteExecutionInput {
+  leaseExpiresAt: string;
+  upstreamIdempotencyKey: string;
+}
+
+export interface StuckExecutionRow {
+  id: string;
+  wallet_id: string;
+  skill: string;
+  request_hash: string;
+  status: QuoteRow["status"];
+  execution_started_at: string | null;
+  execution_lease_expires_at: string | null;
+  execution_attempt_count: number;
+  last_execution_error: string | null;
+  upstream_idempotency_key: string | null;
+  reconciliation_status: string | null;
+  transaction_id: string | null;
+  created_at: string;
+}
+
+export interface AuditEventRow {
+  id: string;
+  event_name: string;
+  wallet_id: string | null;
+  quote_id: string | null;
+  transaction_id: string | null;
+  actor_hash: string | null;
+  group_id: string | null;
+  status: string | null;
+  metadata_json: string | null;
+  shipped_at: string | null;
+  ship_attempts: number;
+  last_ship_error: string | null;
+  sink_name: string | null;
+  created_at: string;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -239,9 +292,10 @@ function isValidQuoteTransition(from: QuoteRow["status"], to: QuoteRow["status"]
   const allowed: Record<QuoteRow["status"], QuoteRow["status"][]> = {
     pending: ["approved", "expired", "canceled"],
     approved: ["executing", "expired", "canceled"],
-    executing: ["succeeded", "failed"],
+    executing: ["succeeded", "failed", "execution_unknown"],
     succeeded: [],
     failed: [],
+    execution_unknown: [],
     expired: [],
     canceled: []
   };
@@ -310,10 +364,21 @@ export class AppDatabase {
     this.ensureQuoteColumn("platform", "TEXT NOT NULL DEFAULT 'telegram'");
     this.ensureQuoteColumn("actor_id_hash", "TEXT");
     this.ensureQuoteColumn("wallet_scope", "TEXT");
+    this.ensureQuoteColumn("execution_started_at", "TEXT");
+    this.ensureQuoteColumn("execution_lease_expires_at", "TEXT");
+    this.ensureQuoteColumn("execution_attempt_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureQuoteColumn("last_execution_error", "TEXT");
+    this.ensureQuoteColumn("upstream_idempotency_key", "TEXT");
+    this.ensureQuoteColumn("reconciliation_status", "TEXT");
+    this.ensureQuoteColumn("reconciled_at", "TEXT");
     this.ensureGroupColumn("platform", "TEXT NOT NULL DEFAULT 'telegram'");
     this.ensureGroupColumn("guild_id_hash", "TEXT");
     this.ensureGroupColumn("cap_enabled", "INTEGER NOT NULL DEFAULT 1");
     this.ensureGroupColumn("spend_cap_usdc", "REAL NOT NULL DEFAULT 0.5");
+    this.ensureAuditEventColumn("shipped_at", "TEXT");
+    this.ensureAuditEventColumn("ship_attempts", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureAuditEventColumn("last_ship_error", "TEXT");
+    this.ensureAuditEventColumn("sink_name", "TEXT");
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS groups (
         id TEXT PRIMARY KEY,
@@ -417,6 +482,10 @@ export class AppDatabase {
         group_id TEXT,
         status TEXT,
         metadata_json TEXT,
+        shipped_at TEXT,
+        ship_attempts INTEGER NOT NULL DEFAULT 0,
+        last_ship_error TEXT,
+        sink_name TEXT,
         created_at TEXT NOT NULL
       )
     `);
@@ -427,6 +496,10 @@ export class AppDatabase {
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS audit_events_quote_idx
       ON audit_events(quote_id, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS audit_events_unshipped_idx
+      ON audit_events(shipped_at, created_at ASC)
     `);
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS inline_payloads (
@@ -474,6 +547,13 @@ export class AppDatabase {
         approved_at TEXT,
         executed_at TEXT,
         transaction_id TEXT,
+        execution_started_at TEXT,
+        execution_lease_expires_at TEXT,
+        execution_attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_execution_error TEXT,
+        upstream_idempotency_key TEXT,
+        reconciliation_status TEXT,
+        reconciled_at TEXT,
         requester_user_id TEXT,
         group_id TEXT,
         requires_group_admin_approval INTEGER NOT NULL DEFAULT 0,
@@ -485,6 +565,10 @@ export class AppDatabase {
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS quotes_user_hash_created_at_idx
       ON quotes(user_hash, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS quotes_execution_reconciliation_idx
+      ON quotes(status, execution_lease_expires_at)
     `);
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS preflight_attempts (
@@ -1247,16 +1331,27 @@ export class AppDatabase {
     return result.changes > 0;
   }
 
-  atomicBeginQuoteExecution(id: string): boolean {
+  atomicBeginQuoteExecution(id: string, input?: BeginQuoteExecutionInput): boolean {
+    const timestamp = nowIso();
+    const leaseExpiresAt = input?.leaseExpiresAt ?? new Date(Date.now() + 120_000).toISOString();
+    const upstreamIdempotencyKey = input?.upstreamIdempotencyKey ?? null;
     const result = this.sqlite
       .prepare(
         `
           UPDATE quotes
-          SET status = 'executing'
-          WHERE id = ? AND status = 'approved' AND expires_at > ?
+          SET status = 'executing',
+              approved_at = COALESCE(approved_at, ?),
+              execution_started_at = ?,
+              execution_lease_expires_at = ?,
+              execution_attempt_count = execution_attempt_count + 1,
+              last_execution_error = NULL,
+              upstream_idempotency_key = COALESCE(upstream_idempotency_key, ?),
+              reconciliation_status = NULL,
+              reconciled_at = NULL
+          WHERE id = ? AND status IN ('pending', 'approved') AND expires_at > ?
         `
       )
-      .run(id, nowIso()) as { changes: number };
+      .run(timestamp, timestamp, leaseExpiresAt, upstreamIdempotencyKey, id, timestamp) as { changes: number };
 
     if (result.changes > 0) {
       const quote = this.getQuote(id);
@@ -1273,25 +1368,163 @@ export class AppDatabase {
     return result.changes > 0;
   }
 
+  getLatestTransactionForQuote(quoteId: string): Record<string, unknown> | undefined {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT *
+          FROM transactions
+          WHERE quote_id = ?
+          ORDER BY created_at DESC
+          LIMIT 1
+        `
+      )
+      .get(quoteId) as Record<string, unknown> | undefined;
+  }
+
+  listExpiredExecutingQuotes(now = nowIso(), limit = 50): QuoteRow[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT *
+          FROM quotes
+          WHERE status = 'executing'
+            AND execution_lease_expires_at IS NOT NULL
+            AND execution_lease_expires_at <= ?
+          ORDER BY execution_lease_expires_at ASC
+          LIMIT ?
+        `
+      )
+      .all(now, limit) as QuoteRow[];
+  }
+
+  listStuckExecutions(limit = 50): StuckExecutionRow[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT
+            id,
+            wallet_id,
+            skill,
+            request_hash,
+            status,
+            execution_started_at,
+            execution_lease_expires_at,
+            execution_attempt_count,
+            last_execution_error,
+            upstream_idempotency_key,
+            reconciliation_status,
+            transaction_id,
+            created_at
+          FROM quotes
+          WHERE status IN ('executing', 'execution_unknown')
+          ORDER BY COALESCE(execution_lease_expires_at, created_at) ASC
+          LIMIT ?
+        `
+      )
+      .all(limit) as StuckExecutionRow[];
+  }
+
+  markQuoteExecutionUnknown(id: string, safeError: string): boolean {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE quotes
+          SET status = 'execution_unknown',
+              execution_lease_expires_at = NULL,
+              last_execution_error = ?,
+              reconciliation_status = 'operator_review_required',
+              reconciled_at = NULL
+          WHERE id = ? AND status = 'executing'
+        `
+      )
+      .run(safeError.slice(0, 512), id) as { changes: number };
+
+    if (result.changes > 0) {
+      const quote = this.getQuote(id);
+      this.createAuditEvent({
+        eventName: "quote.execution_unknown",
+        walletId: quote?.wallet_id ?? null,
+        quoteId: id,
+        actorHash: quote?.user_hash ?? null,
+        groupId: quote?.group_id ?? null,
+        status: "execution_unknown",
+        metadata: { reconciliationStatus: "operator_review_required" }
+      });
+    }
+
+    return result.changes > 0;
+  }
+
+  markExecutionReviewed(id: string): boolean {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE quotes
+          SET reconciliation_status = 'reviewed',
+              reconciled_at = ?
+          WHERE id = ? AND status = 'execution_unknown'
+        `
+      )
+      .run(nowIso(), id) as { changes: number };
+
+    if (result.changes > 0) {
+      const quote = this.getQuote(id);
+      this.createAuditEvent({
+        eventName: "quote.execution_reviewed",
+        walletId: quote?.wallet_id ?? null,
+        quoteId: id,
+        actorHash: quote?.user_hash ?? null,
+        groupId: quote?.group_id ?? null,
+        status: "reviewed"
+      });
+    }
+
+    return result.changes > 0;
+  }
+
   updateQuoteStatus(
     id: string,
     status: QuoteRow["status"],
-    extras?: { executedAt?: string; transactionId?: string }
+    extras?: { executedAt?: string; transactionId?: string; lastExecutionError?: string }
   ): void {
     this.sqlite
       .prepare(
         `
           UPDATE quotes
-          SET status = ?, executed_at = COALESCE(?, executed_at), transaction_id = COALESCE(?, transaction_id)
+          SET status = ?,
+              executed_at = COALESCE(?, executed_at),
+              transaction_id = COALESCE(?, transaction_id),
+              execution_lease_expires_at = CASE WHEN ? IN ('succeeded', 'failed', 'execution_unknown') THEN NULL ELSE execution_lease_expires_at END,
+              last_execution_error = COALESCE(?, last_execution_error),
+              reconciliation_status = CASE
+                WHEN ? = 'execution_unknown' THEN 'operator_review_required'
+                WHEN ? IN ('succeeded', 'failed') THEN 'not_required'
+                ELSE reconciliation_status
+              END
           WHERE id = ?
         `
       )
-      .run(status, extras?.executedAt ?? null, extras?.transactionId ?? null, id);
+      .run(
+        status,
+        extras?.executedAt ?? null,
+        extras?.transactionId ?? null,
+        status,
+        extras?.lastExecutionError ? extras.lastExecutionError.slice(0, 512) : null,
+        status,
+        status,
+        id
+      );
 
-    if (status === "expired" || status === "canceled" || status === "failed") {
+    if (status === "expired" || status === "canceled" || status === "failed" || status === "execution_unknown") {
       const quote = this.getQuote(id);
       this.createAuditEvent({
-        eventName: status === "expired" ? "quote.expired" : "quote.rejected",
+        eventName:
+          status === "expired"
+            ? "quote.expired"
+            : status === "execution_unknown"
+            ? "quote.execution_unknown"
+            : "quote.rejected",
         walletId: quote?.wallet_id ?? null,
         quoteId: id,
         transactionId: extras?.transactionId ?? quote?.transaction_id ?? null,
@@ -1306,7 +1539,7 @@ export class AppDatabase {
     id: string,
     from: QuoteRow["status"],
     to: QuoteRow["status"],
-    extras?: { executedAt?: string; transactionId?: string }
+    extras?: { executedAt?: string; transactionId?: string; lastExecutionError?: string }
   ): boolean {
     if (!isValidQuoteTransition(from, to)) {
       return false;
@@ -1316,11 +1549,30 @@ export class AppDatabase {
       .prepare(
         `
           UPDATE quotes
-          SET status = ?, executed_at = COALESCE(?, executed_at), transaction_id = COALESCE(?, transaction_id)
+          SET status = ?,
+              executed_at = COALESCE(?, executed_at),
+              transaction_id = COALESCE(?, transaction_id),
+              execution_lease_expires_at = CASE WHEN ? IN ('succeeded', 'failed', 'execution_unknown') THEN NULL ELSE execution_lease_expires_at END,
+              last_execution_error = COALESCE(?, last_execution_error),
+              reconciliation_status = CASE
+                WHEN ? = 'execution_unknown' THEN 'operator_review_required'
+                WHEN ? IN ('succeeded', 'failed') THEN 'not_required'
+                ELSE reconciliation_status
+              END
           WHERE id = ? AND status = ?
         `
       )
-      .run(to, extras?.executedAt ?? null, extras?.transactionId ?? null, id, from) as { changes: number };
+      .run(
+        to,
+        extras?.executedAt ?? null,
+        extras?.transactionId ?? null,
+        to,
+        extras?.lastExecutionError ? extras.lastExecutionError.slice(0, 512) : null,
+        to,
+        to,
+        id,
+        from
+      ) as { changes: number };
 
     if (result.changes > 0) {
       const quote = this.getQuote(id);
@@ -1329,6 +1581,8 @@ export class AppDatabase {
           ? "quote_execution_succeeded"
           : to === "failed"
           ? "quote_execution_failed"
+          : to === "execution_unknown"
+          ? "quote_execution_unknown"
           : to === "canceled"
           ? "quote_canceled"
           : to === "expired"
@@ -1593,7 +1847,7 @@ export class AppDatabase {
         timestamp
       );
 
-    if (input.status === "submitted") {
+    if (input.status === "submitted" || input.status === "success") {
       this.createAuditEvent({
         eventName: "paid_call.submitted",
         walletId: input.walletId ?? null,
@@ -1827,6 +2081,46 @@ export class AppDatabase {
       );
   }
 
+  listUnshippedAuditEvents(limit = 50): AuditEventRow[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT *
+          FROM audit_events
+          WHERE shipped_at IS NULL
+          ORDER BY created_at ASC
+          LIMIT ?
+        `
+      )
+      .all(limit) as AuditEventRow[];
+  }
+
+  markAuditEventShipped(id: string, sinkName: string, shippedAt = nowIso()): void {
+    this.sqlite
+      .prepare(
+        `
+          UPDATE audit_events
+          SET shipped_at = ?, sink_name = ?, last_ship_error = NULL
+          WHERE id = ? AND shipped_at IS NULL
+        `
+      )
+      .run(shippedAt, sinkName, id);
+  }
+
+  markAuditEventShipFailed(id: string, sinkName: string, error: string): void {
+    this.sqlite
+      .prepare(
+        `
+          UPDATE audit_events
+          SET ship_attempts = ship_attempts + 1,
+              last_ship_error = ?,
+              sink_name = ?
+          WHERE id = ? AND shipped_at IS NULL
+        `
+      )
+      .run(error.slice(0, 512), sinkName, id);
+  }
+
   private ensureWalletColumn(name: string, type: string) {
     const columns = this.sqlite.prepare("PRAGMA table_info(wallets)").all() as Array<{ name: string }>;
 
@@ -1875,5 +2169,15 @@ export class AppDatabase {
     }
 
     this.sqlite.exec(`ALTER TABLE groups ADD COLUMN ${name} ${type}`);
+  }
+
+  private ensureAuditEventColumn(name: string, type: string) {
+    const columns = this.sqlite.prepare("PRAGMA table_info(audit_events)").all() as Array<{ name: string }>;
+
+    if (columns.some(column => column.name === name)) {
+      return;
+    }
+
+    this.sqlite.exec(`ALTER TABLE audit_events ADD COLUMN ${name} ${type}`);
   }
 }

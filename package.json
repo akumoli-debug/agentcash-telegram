@@ -21,6 +21,7 @@
     "smoke:dry": "tsx scripts/smoke-live.ts --dry-run",
     "smoke:agentcash": "tsx scripts/smoke-live.ts --agentcash",
     "smoke:live": "tsx scripts/smoke-live.ts --telegram --discord --agentcash",
+    "validate:release": "tsx scripts/validate-release.ts",
     "release:check": "tsx scripts/release-check.ts"
   },
   "dependencies": {

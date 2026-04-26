@@ -188,7 +188,7 @@ export async function runSkillCommand(
   }
 
   deps.db.clearSessionState(user.id, ctx.walletScope.chatId);
-  await ctx.reply(result.text);
+  await ctx.replyPrivateOrEphemeral(result.text);
 }
 
 export function ensureSupportedWalletScope(ctx: CommandContext): void {

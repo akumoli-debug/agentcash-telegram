@@ -33,8 +33,9 @@ Before any confirmation or execution, a `quotes` record is created with:
 - `request_hash` — HMAC of the canonical request
 - `quoted_cost_cents` — cost from AgentCash CLI check
 - `max_approved_cost_cents` — approved quote ceiling stored with the quote for audit and execution policy checks
-- `status` — `pending → approved → executing → succeeded` (or `expired / canceled / failed`)
+- `status` — `pending → approved → executing → succeeded` (or `execution_unknown / expired / canceled / failed`)
 - `expires_at` — immutable TTL set at creation
+- `execution_started_at`, `execution_lease_expires_at`, `execution_attempt_count`, `last_execution_error`, `upstream_idempotency_key`, `reconciliation_status`, `reconciled_at` — recovery metadata for ambiguous paid execution outcomes
 - `requester_user_id` and optional `group_id` — durable requester and group context
 - `requires_group_admin_approval` — whether owner/admin approval is required
 
@@ -44,13 +45,17 @@ Confirmation atomically transitions `pending → approved` via:
 UPDATE quotes SET status='approved', approved_at=? WHERE id=? AND status='pending' AND expires_at > ?
 ```
 
-If 0 rows are changed, the confirm is rejected (replay protection). Execution then transitions `approved → executed`. Both the per-user in-memory lock and the SQL check protect against concurrent double-execution.
+If 0 rows are changed, the confirm is rejected (replay protection). Execution then transitions `approved → executing → succeeded` or `execution_unknown`. Both the per-user lock and the SQL check protect against concurrent double-execution.
 
 ---
 
 ## Wallet isolation model
 
 - Each Telegram user gets a distinct AgentCash wallet context.
+- Telegram user-wallet commands are private-chat only: `/start`, `/deposit`, `/balance`, `/cap`, `/history`, `/research`, `/enrich`, and `/generate` refuse group, supergroup, and channel execution.
+- If a private-wallet command is attempted in a group, the bot replies only: `For private wallet commands, DM me directly. In this group, use /groupwallet help.`
+- User-wallet deposit addresses, balances, and history details are never posted to Telegram groups. Group chats must use `/groupwallet` commands for shared wallet operations.
+- Telegram natural-language routing is private-chat only. Group text is not routed to paid user-wallet skills.
 - Wallet home directories are named `<AGENTCASH_HOME_ROOT>/<user_hash>/` where `user_hash` is a keyed HMAC of the Telegram ID — never the raw Telegram ID.
 - Experimental roadmap group wallet home directories are named with a keyed HMAC of the chat ID, not the raw chat ID.
 - SQLite stores wallet metadata. Local/demo private key material is encrypted at rest with AES-256-GCM using `MASTER_ENCRYPTION_KEY`.
@@ -154,6 +159,7 @@ No raw request bodies or user input is logged.
 - No raw private keys, signed payloads, or raw API responses are logged.
 - Transaction logging stores request and response hashes only.
 - Structured `audit_events` record wallet/quote/payment lifecycle events without raw payloads or raw responses.
+- When `AUDIT_SINK=file` or `AUDIT_SINK=http`, an audit outbox worker ships sanitized copies from `audit_events` to the configured external sink and records `shipped_at`, `ship_attempts`, `last_ship_error`, and `sink_name`.
 - Telegram identifiers are hashed before logging.
 - Pino redaction covers: private keys, encrypted inputs, session state JSON, API keys, webhook secrets, raw CLI output fields.
 
@@ -180,8 +186,9 @@ No raw request bodies or user input is logged.
 - The `LockManager` interface serializes wallet provisioning, quote approval, and paid execution.
 - The default `LocalLockManager` is in-process only.
 - SQL-level atomic approve prevents double-execution even under concurrent callbacks.
-- Paid execution also requires an atomic `approved -> executing` quote transition and a unique transaction `idempotency_key`.
+- Paid execution also requires an atomic `pending/approved -> executing` quote transition, an execution lease, and a deterministic upstream idempotency key. The current AgentCash CLI wrapper does not document upstream idempotency support, so the app never retries an ambiguous paid call automatically.
 - Session state stores only `quote_id`, not raw input. Confirm handler verifies the quote ID matches the session before proceeding.
+- User-wallet quote confirmations must happen in a private chat by the original requester. Group-wallet quote confirmations may happen in the matching Telegram group only, and over-cap group confirmations require an owner/admin with fresh Telegram admin verification.
 - Group wallets, inline mode, and Discord are experimental code paths and are not part of the shipped Telegram private-chat MVP demo.
 
 ---
@@ -232,7 +239,7 @@ Important limitations:
 - Move key management to a remote signer or managed KMS/HSM-backed service.
 - Replace SQLite with a production database and implement a distributed lock with TTL, ownership token, and safe release.
 - Use webhook mode with HTTPS and `WEBHOOK_SECRET_TOKEN`.
-- Add structured audit log shipping and alerting for repeated payment failures.
+- Add immutable audit storage, retention policy, and alerting for repeated payment failures or audit ship failures.
 - Add sandboxing around any remaining AgentCash CLI process (e.g., seccomp, network restrictions).
 - Implement key rotation procedures for wallet keys, bot token, API keys, and master encryption key.
 - Review custody model — this MVP assumes the operator can access all wallet keys.

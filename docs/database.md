@@ -5,7 +5,7 @@
 | Provider | Status | Use |
 |---|---|---|
 | `sqlite` | Fully used by the current app and test suite. | Local development, dry smoke, controlled demos. |
-| `postgres` | Adapter and initial migration exist. Startup runs migrations, then fails closed because the synchronous repository methods still need full Postgres wiring. | Production target, not yet a production claim. |
+| `postgres` | Migration scaffold only. `PostgresAdapter` can run migrations, but the runtime repository methods are not implemented. App startup fails before partially starting when `DATABASE_PROVIDER=postgres`. | Future production DB target, not a current runtime option. |
 
 SQLite remains the working local database. It is not a production database for this product because it is local to one host and does not provide the operational model needed for multi-instance bot workers.
 
@@ -18,7 +18,7 @@ DATABASE_URL=
 ALLOW_SQLITE_IN_PRODUCTION=false
 ```
 
-For Postgres migration testing:
+For Postgres migration scaffold testing:
 
 ```bash
 DATABASE_PROVIDER=postgres
@@ -34,7 +34,7 @@ Migration files:
 - `migrations/0001_initial_sqlite.sql`
 - `migrations/0001_initial_postgres.sql`
 
-Postgres migrations are applied by `PostgresAdapter.initialize()` and tracked in `schema_migrations`.
+Postgres migrations are applied by `PostgresAdapter.initialize()` and tracked in `schema_migrations`. This is a migration scaffold, not runtime repository support.
 
 Migration commands:
 
@@ -60,8 +60,14 @@ The migration covers:
 - `key_versions`
 - `wallet_keys`
 
+`audit_events` is also the audit outbox source of truth. Rows include `shipped_at`, `ship_attempts`, `last_ship_error`, and `sink_name` so the worker can ship sanitized copies to file or HTTP sinks without losing the DB audit trail.
+
 ## Current Caveat
 
-The production storage target is not yet fully wired into every repository method. The app refuses to start with `DATABASE_PROVIDER=postgres` after running migrations rather than silently falling back to SQLite.
+The future production DB target is not yet fully wired into every repository method. The app refuses to start with `DATABASE_PROVIDER=postgres` using this exact runtime guard:
 
-Before claiming production storage, finish the repository adapter migration so all methods currently on `AppDatabase` execute through Postgres with transactional tests.
+```text
+Postgres runtime adapter is not implemented yet. Use SQLite for local demo or implement PostgresAdapter before production.
+```
+
+Before claiming production storage, finish the repository adapter migration so all methods currently on `AppDatabase` execute through Postgres with transactional tests. See [postgres-adapter-plan.md](postgres-adapter-plan.md).

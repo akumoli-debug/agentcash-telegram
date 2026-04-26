@@ -6,6 +6,8 @@ import { validateProductionConfig } from "./configValidation.js";
 
 loadDotEnv();
 
+export const TESTED_AGENTCASH_PACKAGE = "agentcash@0.14.3";
+
 const envSchema = z
   .object({
     TELEGRAM_BOT_TOKEN: z.string().trim().optional(),
@@ -27,6 +29,10 @@ const envSchema = z
       .default("false")
       .transform(value => value === true || value === "true"),
     AUDIT_SINK: z.enum(["database", "file", "http"]).default("database"),
+    AUDIT_STRICT_MODE: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
     AUDIT_FILE_PATH: z.string().default(".data/audit-events.jsonl"),
     AUDIT_HTTP_ENDPOINT: z.string().url().optional(),
     ALLOW_DATABASE_AUDIT_IN_PRODUCTION: z
@@ -48,7 +54,7 @@ const envSchema = z
     HEALTH_HOST: z.string().default("0.0.0.0"),
     HEALTH_PORT: z.coerce.number().int().min(0).default(3001),
     AGENTCASH_COMMAND: z.string().default("npx"),
-    AGENTCASH_ARGS: z.string().default("agentcash@latest"),
+    AGENTCASH_ARGS: z.string().default(TESTED_AGENTCASH_PACKAGE),
     AGENTCASH_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
     DEFAULT_SPEND_CAP_USDC: z.coerce.number().positive().default(0.5),
     HARD_SPEND_CAP_USDC: z.coerce.number().positive().default(5),
@@ -175,6 +181,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
   const values = parsed.data;
   validateParsedProductionConfig(values, env);
+  warnOnLatestAgentCashInDevelopment(values);
 
   return {
     ...values,
@@ -200,6 +207,16 @@ function validateParsedProductionConfig(values: z.infer<typeof envSchema>, env: 
       fieldErrors: Object.fromEntries(issues.map(issue => [issue.path.join("."), [issue.message]]))
     });
   }
+}
+
+function warnOnLatestAgentCashInDevelopment(values: z.infer<typeof envSchema>): void {
+  if (values.NODE_ENV !== "development" || !values.AGENTCASH_ARGS.includes("@latest")) {
+    return;
+  }
+
+  console.warn(
+    "AGENTCASH_ARGS contains @latest. This is allowed only for development experiments; pin a tested AgentCash CLI version before demo or release."
+  );
 }
 
 export function getConfig(): AppConfig {

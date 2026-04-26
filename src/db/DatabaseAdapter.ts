@@ -6,6 +6,9 @@ import type { AppConfig } from "../config.js";
 import { ConfigError } from "../lib/errors.js";
 import { AppDatabase } from "./client.js";
 
+export const POSTGRES_RUNTIME_NOT_IMPLEMENTED_MESSAGE =
+  "Postgres runtime adapter is not implemented yet. Use SQLite for local demo or implement PostgresAdapter before production.";
+
 export interface DatabaseAdapter {
   readonly provider: "sqlite" | "postgres";
   initialize(): void | Promise<void>;
@@ -88,4 +91,10 @@ export function createDatabaseAdapter(config: AppConfig): DatabaseAdapter {
   }
 
   return new SQLiteAdapter(config.DATABASE_PATH);
+}
+
+export function assertRuntimeDatabaseAdapterImplemented(config: Pick<AppConfig, "DATABASE_PROVIDER">): void {
+  if (config.DATABASE_PROVIDER === "postgres") {
+    throw new ConfigError(POSTGRES_RUNTIME_NOT_IMPLEMENTED_MESSAGE);
+  }
 }

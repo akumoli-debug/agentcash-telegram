@@ -1,7 +1,7 @@
 import { getConfig } from "./config.js";
 import { createLogger } from "./lib/logger.js";
 import { AppDatabase } from "./db/client.js";
-import { createDatabaseAdapter, SQLiteAdapter } from "./db/DatabaseAdapter.js";
+import { assertRuntimeDatabaseAdapterImplemented, createDatabaseAdapter } from "./db/DatabaseAdapter.js";
 import { WalletManager } from "./wallets/walletManager.js";
 import { AgentCashClient } from "./agentcash/agentcashClient.js";
 import { SkillExecutor } from "./agentcash/skillExecutor.js";
@@ -10,6 +10,8 @@ import { createBot } from "./bot.js";
 import { createDiscordBot, registerDiscordCommands } from "./discordBot.js";
 import { startHealthServer } from "./healthServer.js";
 import { createLockManager } from "./locks/LockManager.js";
+import { createAuditSink } from "./audit/AuditSink.js";
+import { AuditOutboxWorker } from "./audit/AuditOutboxWorker.js";
 
 const ALLOWED_TELEGRAM_UPDATES = [
   "message",
@@ -22,20 +24,17 @@ const ALLOWED_TELEGRAM_UPDATES = [
 async function main() {
   const config = getConfig();
   const logger = createLogger(config.LOG_LEVEL);
+  assertRuntimeDatabaseAdapterImplemented(config);
   const adapter = createDatabaseAdapter(config);
-  if (!(adapter instanceof SQLiteAdapter)) {
-    await adapter.initialize();
-    await adapter.close();
-    throw new Error(
-      "DATABASE_PROVIDER=postgres migrations are available, but the synchronous repository methods have not been fully wired to Postgres yet."
-    );
-  }
-
-  const db: AppDatabase = adapter;
+  const db = adapter as unknown as AppDatabase;
 
   db.initialize();
   const agentcashClient = new AgentCashClient(config);
   const lockManager = createLockManager(config);
+  const auditOutboxWorker =
+    config.AUDIT_SINK === "database"
+      ? null
+      : new AuditOutboxWorker(db, createAuditSink(config, db), config.AUDIT_SINK, logger);
   const healthServer = startHealthServer(config, logger, [
     {
       name: "database",
@@ -63,6 +62,14 @@ async function main() {
       check: () => {
         if (!config.TELEGRAM_BOT_TOKEN && !config.DISCORD_BOT_TOKEN) {
           throw new Error("no platform token configured");
+        }
+      }
+    },
+    {
+      name: "audit_sink",
+      check: async () => {
+        if (config.AUDIT_STRICT_MODE && auditOutboxWorker) {
+          await auditOutboxWorker.checkSinkHealth();
         }
       }
     }
@@ -109,9 +116,11 @@ async function main() {
   const discordBot = config.DISCORD_BOT_TOKEN
     ? createDiscordBot({ config, logger, db, walletManager, skillExecutor })
     : null;
+  auditOutboxWorker?.start();
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "shutting down");
+    auditOutboxWorker?.stop();
     if (bot) {
       bot.stop(signal);
     }
