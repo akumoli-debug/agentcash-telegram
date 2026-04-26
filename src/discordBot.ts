@@ -156,6 +156,7 @@ export function buildDiscordCommandPayload(): unknown[] {
               )
           )
           .addSubcommand(sub => sub.setName("history").setDescription("Show your private wallet history"))
+          .addSubcommand(sub => sub.setName("policy").setDescription("Show your user wallet spend policy"))
           .addSubcommand(sub =>
             sub
               .setName("research")
@@ -191,6 +192,7 @@ export function buildDiscordCommandPayload(): unknown[] {
               )
           )
           .addSubcommand(sub => sub.setName("history").setDescription("Show guild wallet history"))
+          .addSubcommand(sub => sub.setName("policy").setDescription("Show guild wallet spend policy"))
           .addSubcommand(sub => sub.setName("sync-admins").setDescription("Sync Discord managers to guild wallet admins"))
           .addSubcommand(sub =>
             sub
@@ -444,6 +446,40 @@ export async function handleSlashCommand(interaction: ChatInputCommandInteractio
     return;
   }
 
+  if (group === "wallet" && subcommand === "policy") {
+    const discordId = `discord:${interaction.user.id}`;
+    const user = deps.db.getUserByTelegramId(discordId);
+    const wallet = user ? deps.db.getWalletByUserId(user.id) : undefined;
+    const confirmationCapUsdc = user ? deps.walletManager.getConfirmationCap(user) : undefined;
+    const walletPolicy = wallet ? deps.db.getWalletPolicy(wallet.id) : undefined;
+
+    const dailyCapLine =
+      walletPolicy?.daily_cap_usdc !== null && walletPolicy?.daily_cap_usdc !== undefined
+        ? `$${walletPolicy.daily_cap_usdc.toFixed(2)}`
+        : deps.config.POLICY_DAILY_CAP_USDC !== undefined
+        ? `$${deps.config.POLICY_DAILY_CAP_USDC.toFixed(2)} (global)`
+        : "unlimited";
+
+    const weeklyCapLine =
+      walletPolicy?.weekly_cap_usdc !== null && walletPolicy?.weekly_cap_usdc !== undefined
+        ? `$${walletPolicy.weekly_cap_usdc.toFixed(2)}`
+        : deps.config.POLICY_WEEKLY_CAP_USDC !== undefined
+        ? `$${deps.config.POLICY_WEEKLY_CAP_USDC.toFixed(2)} (global)`
+        : "unlimited";
+
+    await replyToInteraction(
+      interaction,
+      [
+        `Wallet status: ${wallet?.status ?? "not created"}`,
+        `Per-call cap: ${confirmationCapUsdc !== undefined ? `$${confirmationCapUsdc.toFixed(2)}` : "disabled"}`,
+        `Daily cap: ${dailyCapLine}`,
+        `Weekly cap: ${weeklyCapLine}`
+      ].join("\n"),
+      true
+    );
+    return;
+  }
+
   if (group === "wallet" && subcommand === "research") {
     const query = interaction.options.getString("query", true);
     await runSkillCommand(ctx, deps, "research", query);
@@ -592,6 +628,31 @@ async function handleGuildCommand(
       entries.length === 0
         ? "No guild wallet transaction history yet."
         : ["Guild wallet transactions:", ...entries.map((entry, index) => `${index + 1}. ${entry.skill ?? "unknown"} ${entry.status}`)].join("\n"),
+      true
+    );
+    return;
+  }
+
+  if (subcommand === "policy") {
+    const walletPolicy = deps.db.getWalletPolicy(context.group.wallet_id);
+    const perCallCap = deps.walletManager.getGroupConfirmationCap(context.group);
+    const dailyCapLine =
+      walletPolicy?.daily_cap_usdc !== null && walletPolicy?.daily_cap_usdc !== undefined
+        ? `$${walletPolicy.daily_cap_usdc.toFixed(2)}`
+        : `$${(deps.config.GROUP_DAILY_CAP_USDC ?? 25).toFixed(2)} (global)`;
+    const weeklyCapLine =
+      walletPolicy?.weekly_cap_usdc !== null && walletPolicy?.weekly_cap_usdc !== undefined
+        ? `$${walletPolicy.weekly_cap_usdc.toFixed(2)}`
+        : "unlimited";
+
+    await replyToInteraction(
+      interaction,
+      [
+        `Guild wallet status: ${deps.db.getWalletById(context.group.wallet_id)?.status ?? "not created"}`,
+        `Per-call cap: ${perCallCap !== undefined ? `$${perCallCap.toFixed(2)}` : "disabled"}`,
+        `Daily cap: ${dailyCapLine}`,
+        `Weekly cap: ${weeklyCapLine}`
+      ].join("\n"),
       true
     );
     return;

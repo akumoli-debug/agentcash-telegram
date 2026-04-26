@@ -15,6 +15,7 @@ import { createGenerateCommand } from "./commands/generate.js";
 import { createCapCommand } from "./commands/cap.js";
 import { createHistoryCommand } from "./commands/history.js";
 import { createGroupWalletCommand } from "./commands/groupWallet.js";
+import { createPolicyCommand } from "./commands/policy.js";
 import { createInlineQueryHandler } from "./commands/inlineMode.js";
 import { executeSkillRequest } from "./commands/skillCommand.js";
 import {
@@ -264,6 +265,7 @@ export function createBot(deps: {
     await ctx.reply(`Group wallet status: ${wallet?.status ?? "not created"}.`);
   });
   bot.command("groupwallet", createGroupWalletCommand(deps));
+  bot.command("policy", createPolicyCommand(deps));
 
   bot.command("pair", async ctx => {
     if (!ctx.from || !ctx.chat) return;

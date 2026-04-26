@@ -92,8 +92,9 @@ More diagrams:
 | Confirmation | Over-cap, natural-language routed, and forced-confirmation paths require user confirmation before execution. |
 | Replay protection | Quote approval and execution use SQL status transitions so repeated button clicks cannot approve or consume the same quote twice. |
 | Idempotency | Quote execution stores a deterministic upstream idempotency key derived from quote, wallet, and request hash. Execution moves through `pending`, `approved`, `executing`, `succeeded`, `execution_unknown`, `failed`, `canceled`, and `expired`. The current AgentCash CLI wrapper does not document upstream idempotency support, so automatic paid retry is disabled. |
-| Caps | Per-user and group/guild caps exist, plus `HARD_SPEND_CAP_USDC`. Group/guild wallets also have a configured daily cap check. |
-| Freeze controls | Users can freeze their own wallet. Telegram group admins and Discord guild managers can freeze shared wallets. Frozen wallets cannot create quotes or execute paid calls; balance, deposit, and history still work. |
+| Caps | Per-user and group/guild per-call caps, plus `HARD_SPEND_CAP_USDC` (absolute deny). Optional daily and weekly per-wallet caps via `POLICY_DAILY_CAP_USDC` / `POLICY_WEEKLY_CAP_USDC`, with per-wallet overrides via `/policy dailycap`. Group wallets have a daily cap via `GROUP_DAILY_CAP_USDC`. |
+| Policy engine | Every quote passes through `PolicyEngine` which evaluates frozen-wallet, skill allowlist, daily/weekly caps, hard cap, trusted-skill auto-approve, first-spend, per-call cap, and high-cost threshold in that order. The policy state is snapshotted immutably in `policy_decisions` for each quote. See [docs/policy-engine.md](docs/policy-engine.md). |
+| Freeze controls | Users can freeze their own wallet (`/policy freeze` or `/freeze`). Telegram group admins and Discord guild managers can freeze shared wallets. Frozen wallets cannot create quotes or execute paid calls; balance, deposit, and history still work. |
 | Audit | Quote, transaction, admin, wallet, inline, replay, and execution events are recorded in `audit_events`. If `AUDIT_SINK=file` or `http`, an outbox worker ships sanitized copies to the configured sink and marks rows shipped. |
 
 ## Supported Platforms
@@ -125,6 +126,11 @@ More diagrams:
 | `/freeze` | private/group | stable MVP for private, experimental for group |
 | `/unfreeze` | private/group | stable MVP for private, experimental for group |
 | `/status` | private/group | stable MVP for private, experimental for group |
+| `/policy [show]` | private | stable MVP |
+| `/policy dailycap <amount\|off>` | private | stable MVP |
+| `/policy weeklycap <amount\|off>` | private | stable MVP |
+| `/policy allow-skill <skill>` | private | stable MVP |
+| `/policy block-skill <skill>` | private | stable MVP |
 | `/groupwallet create` | group/supergroup | experimental |
 | `/groupwallet sync-admins` | group/supergroup | experimental |
 | `/groupwallet roles` | group/supergroup | experimental |
@@ -323,6 +329,7 @@ To allow users: set `TELEGRAM_ALLOWED_USERS=<comma-separated raw IDs>` (hashed a
 Operational docs:
 
 - [Gateway security](docs/gateway-security.md)
+- [Policy engine](docs/policy-engine.md)
 - [Deployment](docs/deployment.md)
 - [Readiness](docs/readiness.md)
 - [Database](docs/database.md)

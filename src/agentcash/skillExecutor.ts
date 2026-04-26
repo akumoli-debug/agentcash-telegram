@@ -14,6 +14,7 @@ import { defaultLockManager, type LockManager } from "../lib/lockManager.js";
 import type { AppLogger } from "../lib/logger.js";
 import { WalletManager, type TelegramProfile } from "../wallets/walletManager.js";
 import { AgentCashClient, type AgentCashFetchResult } from "./agentcashClient.js";
+import { PolicyEngine } from "../policy/PolicyEngine.js";
 
 export type SkillName = "research" | "enrich" | "generate";
 
@@ -172,14 +173,19 @@ export function makeUpstreamIdempotencyKey(input: {
 }
 
 export class SkillExecutor {
+  private readonly policyEngine: PolicyEngine;
+
   constructor(
     private readonly db: AppDatabase,
     private readonly walletManager: WalletManager,
     private readonly agentcashClient: AgentCashClient,
     private readonly logger: AppLogger,
     private readonly config: AppConfig,
-    private readonly lockManager: LockManager = defaultLockManager
-  ) {}
+    private readonly lockManager: LockManager = defaultLockManager,
+    policyEngine?: PolicyEngine
+  ) {
+    this.policyEngine = policyEngine ?? new PolicyEngine(db, config);
+  }
 
   getSkillDefinition(name: SkillName): SkillDefinition<string> {
     return skillDefinitions[name];
@@ -217,11 +223,42 @@ export class SkillExecutor {
         userHash,
         requestHash
       );
-      this.assertGroupDailyCap(group, quotedCostCents, userHash, wallet.id, skill.name, requestHash);
 
-      const hardCapCents = Math.round(this.config.HARD_SPEND_CAP_USDC * 100);
+      const confirmationCap = group
+        ? this.walletManager.getGroupConfirmationCap(group)
+        : this.walletManager.getConfirmationCap(user);
+      const groupAdminCap = group ? (group.spend_cap_usdc ?? this.config.DEFAULT_SPEND_CAP_USDC) : undefined;
 
-      if (!this.config.ALLOW_HIGH_VALUE_CALLS && quotedCostCents > hardCapCents) {
+      const policyDecision = this.policyEngine.evaluate({
+        platform: context.telegramId.startsWith("discord:") ? "discord" : "telegram",
+        actorIdHash: userHash,
+        walletId: wallet.id,
+        walletStatus: wallet.status,
+        groupId: group?.id ?? null,
+        skill: skill.name,
+        endpoint: skill.endpoint,
+        quotedCostCents,
+        isDevUnquoted,
+        confirmationCapUsdc: confirmationCap,
+        groupAdminCapUsdc: groupAdminCap
+      });
+
+      const isDenyOutcome =
+        policyDecision.outcome === "deny_frozen" ||
+        policyDecision.outcome === "deny_daily_cap" ||
+        policyDecision.outcome === "deny_weekly_cap" ||
+        policyDecision.outcome === "deny_skill_blocked" ||
+        policyDecision.outcome === "deny_platform" ||
+        policyDecision.outcome === "deny_hard_cap";
+
+      if (isDenyOutcome) {
+        const errorCode =
+          policyDecision.outcome === "deny_frozen" ? "WALLET_FROZEN"
+          : policyDecision.outcome === "deny_daily_cap" ? "DAILY_CAP_EXCEEDED"
+          : policyDecision.outcome === "deny_weekly_cap" ? "WEEKLY_CAP_EXCEEDED"
+          : policyDecision.outcome === "deny_skill_blocked" ? "SKILL_BLOCKED"
+          : policyDecision.outcome === "deny_hard_cap" ? "HARD_CAP_EXCEEDED"
+          : "PLATFORM_DENIED";
         this.db.logPreflightAttempt({
           userHash,
           walletId: wallet.id,
@@ -229,12 +266,18 @@ export class SkillExecutor {
           endpoint: skill.endpoint,
           requestHash,
           failureStage: "cap",
-          errorCode: "HARD_CAP_EXCEEDED",
-          safeErrorMessage: "Request exceeds hard MVP safety cap"
+          errorCode,
+          safeErrorMessage: policyDecision.reason
         });
-        throw new SpendingCapError("This request exceeds the hard MVP safety cap.", {
+        if (policyDecision.outcome === "deny_frozen") {
+          throw new ValidationError("This wallet is frozen. Balance, deposit, and history still work.");
+        }
+        if (policyDecision.outcome === "deny_skill_blocked" || policyDecision.outcome === "deny_platform") {
+          throw new ValidationError(policyDecision.reason);
+        }
+        throw new SpendingCapError(policyDecision.reason, {
           quotedCostCents,
-          hardCapCents
+          hardCapCents: Math.round(this.config.HARD_SPEND_CAP_USDC * 100)
         });
       }
 
@@ -258,18 +301,13 @@ export class SkillExecutor {
         });
       }
 
+      const hardCapCents = Math.round(this.config.HARD_SPEND_CAP_USDC * 100);
       const maxApprovedCostCents = Math.min(Math.max(quotedCostCents * 2, quotedCostCents + 10), hardCapCents);
       const expiresAt = new Date(
         Date.now() + this.config.PENDING_CONFIRMATION_TTL_SECONDS * 1000
       ).toISOString();
 
-      const confirmationCap = group
-        ? this.walletManager.getGroupConfirmationCap(group)
-        : this.walletManager.getConfirmationCap(user);
-      const requiresGroupAdminApproval =
-        Boolean(group) &&
-        confirmationCap !== undefined &&
-        quotedCostCents > Math.round(confirmationCap * 100);
+      const requiresGroupAdminApproval = policyDecision.requiresGroupAdminApproval;
 
       const quote = this.db.createQuote({
         userHash,
@@ -290,16 +328,23 @@ export class SkillExecutor {
         walletScope: group ? (group.platform === "discord" ? "discord_guild" : "telegram_group") : "user"
       });
 
+      this.db.recordPolicyDecision(quote.id, wallet.id, userHash, policyDecision);
+
       const needsConfirmation =
         context.forceConfirmation ||
-        (confirmationCap !== undefined && quotedCostCents > Math.round(confirmationCap * 100));
+        policyDecision.outcome === "require_confirmation" ||
+        policyDecision.outcome === "require_group_admin_approval";
 
       if (needsConfirmation) {
         const costLine = isDevUnquoted
           ? `This ${skill.name} call may incur a charge (dev mode: price unknown).`
           : `This ${skill.name} call is quoted at ${formatUsdCents(quotedCostCents)}.`;
         const capLine =
-          confirmationCap !== undefined
+          policyDecision.policyType === "first_spend"
+            ? "This is the first spend from this wallet."
+            : policyDecision.policyType === "high_cost"
+            ? policyDecision.reason
+            : confirmationCap !== undefined
             ? group
               ? `This group's per-call cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
               : `Your per-call confirmation cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
@@ -803,38 +848,6 @@ export class SkillExecutor {
     }
   }
 
-  private assertGroupDailyCap(
-    group: GroupRow | undefined,
-    quotedCostCents: number,
-    userHash: string,
-    walletId: string,
-    skillName: string,
-    requestHash: string
-  ): void {
-    if (!group) {
-      return;
-    }
-
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const spent = this.db.getDailySpendCentsForGroup(group.id, since);
-    const limit = Math.round((this.config.GROUP_DAILY_CAP_USDC ?? 25) * 100);
-
-    if (spent + quotedCostCents <= limit) {
-      return;
-    }
-
-    this.db.logPreflightAttempt({
-      userHash,
-      walletId,
-      skill: skillName,
-      requestHash,
-      failureStage: "cap",
-      errorCode: "GROUP_DAILY_CAP_EXCEEDED",
-      safeErrorMessage: "Group daily cap exceeded"
-    });
-
-    throw new SpendingCapError("This group wallet has reached its daily spend cap.");
-  }
 }
 
 function safeExecutionErrorMessage(error: unknown): string {

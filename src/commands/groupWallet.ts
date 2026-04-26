@@ -258,6 +258,46 @@ export function createGroupWalletCommand(deps: {
         return;
       }
 
+      if (subcommand === "policy") {
+        const walletPolicy = deps.db.getWalletPolicy(groupContext.wallet.id);
+        const perCallCap = deps.walletManager.getGroupConfirmationCap(groupContext.group);
+        const dailyCapLine =
+          walletPolicy?.daily_cap_usdc !== null && walletPolicy?.daily_cap_usdc !== undefined
+            ? `$${walletPolicy.daily_cap_usdc.toFixed(2)}`
+            : `$${(deps.config.GROUP_DAILY_CAP_USDC ?? 25).toFixed(2)} (global)`;
+        const weeklyCapLine =
+          walletPolicy?.weekly_cap_usdc !== null && walletPolicy?.weekly_cap_usdc !== undefined
+            ? `$${walletPolicy.weekly_cap_usdc.toFixed(2)}`
+            : "unlimited";
+
+        await ctx.reply(
+          [
+            `Group wallet status: ${groupContext.wallet.status}`,
+            `Per-call cap: ${perCallCap !== undefined ? `$${perCallCap.toFixed(2)}` : "disabled"}`,
+            `Daily cap: ${dailyCapLine}`,
+            `Weekly cap: ${weeklyCapLine}`
+          ].join("\n")
+        );
+        return;
+      }
+
+      if (subcommand === "dailycap") {
+        await assertInternalAndFreshTelegramAdmin(ctx, deps, groupContext.group, groupContext.user, chatId);
+        const arg = rest[0] ?? "";
+        if (!arg || arg.toLowerCase() === "off") {
+          deps.db.upsertWalletPolicy(groupContext.wallet.id, { dailyCapUsdc: null });
+          await ctx.reply(`Group daily cap removed. Falling back to global cap: $${(deps.config.GROUP_DAILY_CAP_USDC ?? 25).toFixed(2)}.`);
+          return;
+        }
+        const parsed = amountSchema.safeParse(arg);
+        if (!parsed.success) {
+          throw new ValidationError("Usage: /groupwallet dailycap <amount|off>");
+        }
+        deps.db.upsertWalletPolicy(groupContext.wallet.id, { dailyCapUsdc: parsed.data });
+        await ctx.reply(`Group daily spend cap set to $${parsed.data.toFixed(2)} USDC.`);
+        return;
+      }
+
       await replyWithGroupWalletHelp(ctx);
     } catch (error) {
       await replyWithError(ctx, error);
@@ -276,6 +316,8 @@ async function replyWithGroupWalletHelp(ctx: Context): Promise<void> {
       "/groupwallet sync-admins",
       "/groupwallet history",
       "/groupwallet cap <amount>",
+      "/groupwallet policy",
+      "/groupwallet dailycap <amount|off>",
       "/groupwallet help"
     ].join("\n")
   );

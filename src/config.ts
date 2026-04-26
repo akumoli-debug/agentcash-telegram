@@ -102,6 +102,21 @@ const envSchema = z
       .transform(value => value === true || value === "true"),
     // Comma-separated hashed chat IDs that bypass the require-mention rule.
     GROUP_FREE_RESPONSE_CHAT_IDS: z.string().default(""),
+    // Payment policy engine: per-wallet caps, trusted skills, first-spend confirmation.
+    // Daily and weekly caps are per-wallet (users). Group daily cap uses GROUP_DAILY_CAP_USDC.
+    POLICY_DAILY_CAP_USDC: z.optional(z.coerce.number().positive()),
+    POLICY_WEEKLY_CAP_USDC: z.optional(z.coerce.number().positive()),
+    // Above this threshold a confirmation is always required (independent of per-call cap).
+    POLICY_HIGH_COST_THRESHOLD_USDC: z.optional(z.coerce.number().positive()),
+    // Comma-separated skill names that are auto-approved without confirmation when cost is low.
+    POLICY_TRUSTED_SKILLS: z.string().default(""),
+    // Maximum cost in USDC for a trusted-skill auto-approval to fire.
+    POLICY_TRUSTED_AUTO_APPROVE_MAX_USDC: z.coerce.number().positive().default(0.01),
+    // Require confirmation for the very first spend from a wallet (default false to preserve existing behavior).
+    POLICY_FIRST_SPEND_REQUIRE_CONFIRMATION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
     RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().int().positive().default(30),
     RATE_LIMIT_MAX_PER_HOUR: z.coerce.number().int().positive().default(100),
     RATE_LIMIT_QUOTE_MAX_PER_MINUTE: z.coerce.number().int().positive().default(8),

@@ -274,6 +274,37 @@ export interface PairingCodeRow {
   approved_at: string | null;
 }
 
+export interface WalletPolicyRow {
+  id: string;
+  wallet_id: string;
+  daily_cap_usdc: number | null;
+  weekly_cap_usdc: number | null;
+  skill_allowlist: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SkillPolicyRow {
+  id: string;
+  wallet_id: string;
+  skill: string;
+  status: "allowed" | "trusted" | "blocked";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PolicyDecisionRow {
+  id: string;
+  quote_id: string;
+  wallet_id: string;
+  actor_id_hash: string | null;
+  outcome: string;
+  policy_type: string;
+  reason: string | null;
+  snapshot_json: string;
+  decided_at: string;
+}
+
 export interface AuditEventRow {
   id: string;
   event_name: string;
@@ -622,6 +653,52 @@ export class AppDatabase {
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS gateway_pairing_codes_actor_platform_status_idx
       ON gateway_pairing_codes(platform, actor_id_hash, status, expires_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS wallet_policies (
+        id TEXT PRIMARY KEY,
+        wallet_id TEXT NOT NULL UNIQUE,
+        daily_cap_usdc REAL,
+        weekly_cap_usdc REAL,
+        skill_allowlist TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (wallet_id) REFERENCES wallets(id)
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS skill_policies (
+        id TEXT PRIMARY KEY,
+        wallet_id TEXT NOT NULL,
+        skill TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'allowed' CHECK (status IN ('allowed', 'trusted', 'blocked')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (wallet_id) REFERENCES wallets(id),
+        UNIQUE (wallet_id, skill)
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS skill_policies_wallet_idx
+      ON skill_policies(wallet_id, skill)
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS policy_decisions (
+        id TEXT PRIMARY KEY,
+        quote_id TEXT NOT NULL UNIQUE,
+        wallet_id TEXT NOT NULL,
+        actor_id_hash TEXT,
+        outcome TEXT NOT NULL,
+        policy_type TEXT NOT NULL,
+        reason TEXT,
+        snapshot_json TEXT NOT NULL,
+        decided_at TEXT NOT NULL,
+        FOREIGN KEY (quote_id) REFERENCES quotes(id)
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS policy_decisions_wallet_decided_at_idx
+      ON policy_decisions(wallet_id, decided_at DESC)
     `);
   }
 
@@ -2264,6 +2341,124 @@ export class AppDatabase {
       .all(platform, now) as Array<{ actor_id_hash: string }>;
 
     return rows.map(r => r.actor_id_hash);
+  }
+
+  getWalletPolicy(walletId: string): WalletPolicyRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM wallet_policies WHERE wallet_id = ?")
+      .get(walletId) as WalletPolicyRow | undefined;
+  }
+
+  upsertWalletPolicy(
+    walletId: string,
+    input: { dailyCapUsdc?: number | null; weeklyCapUsdc?: number | null; skillAllowlist?: string | null }
+  ): WalletPolicyRow {
+    const existing = this.getWalletPolicy(walletId);
+    const timestamp = nowIso();
+
+    if (existing) {
+      this.sqlite
+        .prepare(
+          `UPDATE wallet_policies
+           SET daily_cap_usdc = ?, weekly_cap_usdc = ?, skill_allowlist = ?, updated_at = ?
+           WHERE wallet_id = ?`
+        )
+        .run(
+          input.dailyCapUsdc !== undefined ? input.dailyCapUsdc : existing.daily_cap_usdc,
+          input.weeklyCapUsdc !== undefined ? input.weeklyCapUsdc : existing.weekly_cap_usdc,
+          input.skillAllowlist !== undefined ? input.skillAllowlist : existing.skill_allowlist,
+          timestamp,
+          walletId
+        );
+    } else {
+      this.sqlite
+        .prepare(
+          `INSERT INTO wallet_policies (id, wallet_id, daily_cap_usdc, weekly_cap_usdc, skill_allowlist, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          makeId("wpl"),
+          walletId,
+          input.dailyCapUsdc ?? null,
+          input.weeklyCapUsdc ?? null,
+          input.skillAllowlist ?? null,
+          timestamp,
+          timestamp
+        );
+    }
+
+    return this.getWalletPolicy(walletId)!;
+  }
+
+  getSkillPolicy(walletId: string, skill: string): SkillPolicyRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM skill_policies WHERE wallet_id = ? AND skill = ?")
+      .get(walletId, skill) as SkillPolicyRow | undefined;
+  }
+
+  upsertSkillPolicy(walletId: string, skill: string, status: "allowed" | "trusted" | "blocked"): SkillPolicyRow {
+    const existing = this.getSkillPolicy(walletId, skill);
+    const timestamp = nowIso();
+
+    if (existing) {
+      this.sqlite
+        .prepare("UPDATE skill_policies SET status = ?, updated_at = ? WHERE wallet_id = ? AND skill = ?")
+        .run(status, timestamp, walletId, skill);
+    } else {
+      this.sqlite
+        .prepare(
+          `INSERT INTO skill_policies (id, wallet_id, skill, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(makeId("spl"), walletId, skill, status, timestamp, timestamp);
+    }
+
+    return this.getSkillPolicy(walletId, skill)!;
+  }
+
+  getWalletSpendCents(walletId: string, sinceIso: string): number {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS total
+         FROM transactions
+         WHERE wallet_id = ? AND created_at >= ? AND status IN ('submitted', 'success')`
+      )
+      .get(walletId, sinceIso) as { total: number };
+    return row.total;
+  }
+
+  hasWalletSucceededTransactions(walletId: string): boolean {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS count FROM transactions
+         WHERE wallet_id = ? AND status IN ('submitted', 'success') LIMIT 1`
+      )
+      .get(walletId) as { count: number };
+    return row.count > 0;
+  }
+
+  recordPolicyDecision(
+    quoteId: string,
+    walletId: string,
+    actorIdHash: string | null,
+    decision: { outcome: string; policyType: string; reason: string; snapshotJson: string }
+  ): PolicyDecisionRow {
+    const id = makeId("pol");
+    const timestamp = nowIso();
+    this.sqlite
+      .prepare(
+        `INSERT INTO policy_decisions (id, quote_id, wallet_id, actor_id_hash, outcome, policy_type, reason, snapshot_json, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, quoteId, walletId, actorIdHash, decision.outcome, decision.policyType, decision.reason, decision.snapshotJson, timestamp);
+
+    return this.sqlite.prepare("SELECT * FROM policy_decisions WHERE id = ?").get(id) as PolicyDecisionRow;
+  }
+
+  getPolicyDecision(quoteId: string): PolicyDecisionRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM policy_decisions WHERE quote_id = ?")
+      .get(quoteId) as PolicyDecisionRow | undefined;
   }
 
   private ensureWalletColumn(name: string, type: string) {
