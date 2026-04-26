@@ -291,6 +291,23 @@ corepack pnpm db:migrate
 
 ## Security Posture
 
+### Gateway Security Layer
+
+Every inbound platform event passes through the gateway security policy before any command executes. The policy is a pure function with no database side effects. Default is maximally secure:
+
+| Control | Default |
+| --- | --- |
+| Unknown user access | **denied** — no wallet, no command |
+| Pairing mode | `disabled` — opt-in via `PAIRING_MODE=dm_code` |
+| Group mention required | **true** — plain group text silently dropped unless `@Bot` mentioned |
+| Private commands in groups | **blocked** — `/start`, `/deposit`, `/balance`, `/cap`, `/history`, `/research`, `/enrich`, `/generate` reply with DM instruction, never wallet data |
+| Bot self-messages | **silently dropped** — prevents feedback loops |
+| Pairing codes in groups | **never** — codes only issued in private/DM |
+
+To allow users: set `TELEGRAM_ALLOWED_USERS=<comma-separated raw IDs>` (hashed at startup) or set `GATEWAY_ALLOW_ALL_USERS=true` for open bots. See [docs/gateway-security.md](docs/gateway-security.md) for the full allowlist, pairing, and group-mention reference.
+
+### Transport and Custody
+
 - Platform identifiers are hashed for wallet/audit surfaces where practical.
 - Raw Telegram/Discord names are not stored for group/guild admin sync.
 - Private keys are encrypted at rest for local demo custody.
@@ -305,6 +322,7 @@ corepack pnpm db:migrate
 
 Operational docs:
 
+- [Gateway security](docs/gateway-security.md)
 - [Deployment](docs/deployment.md)
 - [Readiness](docs/readiness.md)
 - [Database](docs/database.md)

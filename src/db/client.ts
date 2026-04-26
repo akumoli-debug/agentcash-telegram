@@ -263,6 +263,17 @@ export interface StuckExecutionRow {
   created_at: string;
 }
 
+export interface PairingCodeRow {
+  id: string;
+  platform: string;
+  actor_id_hash: string;
+  code_hash: string;
+  status: "pending" | "approved" | "expired" | "revoked";
+  created_at: string;
+  expires_at: string;
+  approved_at: string | null;
+}
+
 export interface AuditEventRow {
   id: string;
   event_name: string;
@@ -595,6 +606,22 @@ export class AppDatabase {
         created_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL
       )
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS gateway_pairing_codes (
+        id TEXT PRIMARY KEY,
+        platform TEXT NOT NULL,
+        actor_id_hash TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'expired', 'revoked')),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        approved_at TEXT
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS gateway_pairing_codes_actor_platform_status_idx
+      ON gateway_pairing_codes(platform, actor_id_hash, status, expires_at DESC)
     `);
   }
 
@@ -2119,6 +2146,124 @@ export class AppDatabase {
         `
       )
       .run(error.slice(0, 512), sinkName, id);
+  }
+
+  createPairingCode(input: {
+    id: string;
+    platform: string;
+    actorIdHash: string;
+    codeHash: string;
+    expiresAt: string;
+  }): PairingCodeRow {
+    const timestamp = nowIso();
+    this.sqlite
+      .prepare(
+        `
+          INSERT INTO gateway_pairing_codes (
+            id, platform, actor_id_hash, code_hash, status, created_at, expires_at, approved_at
+          ) VALUES (?, ?, ?, ?, 'pending', ?, ?, NULL)
+        `
+      )
+      .run(input.id, input.platform, input.actorIdHash, input.codeHash, timestamp, input.expiresAt);
+
+    this.createAuditEvent({
+      eventName: "gateway_pairing.code_issued",
+      actorHash: input.actorIdHash,
+      status: "pending",
+      metadata: { platform: input.platform }
+    });
+
+    return this.sqlite
+      .prepare("SELECT * FROM gateway_pairing_codes WHERE id = ?")
+      .get(input.id) as PairingCodeRow;
+  }
+
+  getPendingPairingCode(platform: string, actorIdHash: string, now = nowIso()): PairingCodeRow | undefined {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT * FROM gateway_pairing_codes
+          WHERE platform = ? AND actor_id_hash = ? AND status = 'pending' AND expires_at > ?
+          ORDER BY expires_at DESC
+          LIMIT 1
+        `
+      )
+      .get(platform, actorIdHash, now) as PairingCodeRow | undefined;
+  }
+
+  expireActorPairingCodes(platform: string, actorIdHash: string): void {
+    this.sqlite
+      .prepare(
+        `
+          UPDATE gateway_pairing_codes
+          SET status = 'expired'
+          WHERE platform = ? AND actor_id_hash = ? AND status = 'pending'
+        `
+      )
+      .run(platform, actorIdHash);
+  }
+
+  approvePairingCode(id: string): boolean {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE gateway_pairing_codes
+          SET status = 'approved', approved_at = ?
+          WHERE id = ? AND status = 'pending' AND expires_at > ?
+        `
+      )
+      .run(nowIso(), id, nowIso()) as { changes: number };
+
+    if (result.changes > 0) {
+      const row = this.sqlite
+        .prepare("SELECT * FROM gateway_pairing_codes WHERE id = ?")
+        .get(id) as PairingCodeRow;
+      this.createAuditEvent({
+        eventName: "gateway_pairing.code_approved",
+        actorHash: row.actor_id_hash,
+        status: "approved",
+        metadata: { platform: row.platform }
+      });
+    }
+
+    return result.changes > 0;
+  }
+
+  revokeActorPairingCodes(platform: string, actorIdHash: string): number {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE gateway_pairing_codes
+          SET status = 'revoked'
+          WHERE platform = ? AND actor_id_hash = ? AND status IN ('pending', 'approved')
+        `
+      )
+      .run(platform, actorIdHash) as { changes: number };
+
+    if (result.changes > 0) {
+      this.createAuditEvent({
+        eventName: "gateway_pairing.codes_revoked",
+        actorHash: actorIdHash,
+        status: "revoked",
+        metadata: { platform, count: result.changes }
+      });
+    }
+
+    return result.changes;
+  }
+
+  listApprovedPairingActors(platform: string, now = nowIso()): string[] {
+    const rows = this.sqlite
+      .prepare(
+        `
+          SELECT DISTINCT actor_id_hash
+          FROM gateway_pairing_codes
+          WHERE platform = ? AND status = 'approved' AND expires_at > ?
+        `
+      )
+      .all(platform, now) as Array<{ actor_id_hash: string }>;
+
+    return rows.map(r => r.actor_id_hash);
   }
 
   private ensureWalletColumn(name: string, type: string) {

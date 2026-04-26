@@ -12,6 +12,7 @@ import { startHealthServer } from "./healthServer.js";
 import { createLockManager } from "./locks/LockManager.js";
 import { createAuditSink } from "./audit/AuditSink.js";
 import { AuditOutboxWorker } from "./audit/AuditOutboxWorker.js";
+import { buildSecurityPolicyConfig } from "./gateway/buildPolicyConfig.js";
 
 const ALLOWED_TELEGRAM_UPDATES = [
   "message",
@@ -110,11 +111,12 @@ async function main() {
   const walletManager = new WalletManager(db, config, agentcashClient, lockManager);
   const skillExecutor = new SkillExecutor(db, walletManager, agentcashClient, logger, config, lockManager);
   const routerClient = new RouterClient(config, logger);
+  const securityPolicy = buildSecurityPolicyConfig(config);
   const bot = config.TELEGRAM_BOT_TOKEN
-    ? createBot({ config, logger, db, walletManager, skillExecutor, routerClient })
+    ? createBot({ config, logger, db, walletManager, skillExecutor, routerClient, securityPolicy })
     : null;
   const discordBot = config.DISCORD_BOT_TOKEN
-    ? createDiscordBot({ config, logger, db, walletManager, skillExecutor })
+    ? createDiscordBot({ config, logger, db, walletManager, skillExecutor, securityPolicy })
     : null;
   auditOutboxWorker?.start();
 

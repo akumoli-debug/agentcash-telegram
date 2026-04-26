@@ -330,5 +330,21 @@ export const schemaStatements = [
   `
     CREATE INDEX IF NOT EXISTS request_events_user_created_at_idx
     ON request_events(user_id, created_at DESC)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS gateway_pairing_codes (
+      id TEXT PRIMARY KEY,
+      platform TEXT NOT NULL,
+      actor_id_hash TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'expired', 'revoked')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      approved_at TEXT
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS gateway_pairing_codes_actor_platform_status_idx
+    ON gateway_pairing_codes(platform, actor_id_hash, status, expires_at DESC)
   `
 ] as const;

@@ -27,6 +27,7 @@ import { hashSensitiveValue } from "./lib/crypto.js";
 import { QuoteError, ValidationError } from "./lib/errors.js";
 import type { AppLogger } from "./lib/logger.js";
 import { WalletManager } from "./wallets/walletManager.js";
+import { evaluatePolicy, type SecurityPolicyConfig } from "./gateway/securityPolicy.js";
 
 const CONFIRM_PREFIX = "discord_confirm:";
 const CANCEL_PREFIX = "discord_cancel:";
@@ -39,7 +40,8 @@ export interface DiscordDeps {
   skillExecutor: SkillExecutor;
 }
 
-export function createDiscordBot(deps: DiscordDeps): Client {
+export function createDiscordBot(deps: DiscordDeps & { securityPolicy: SecurityPolicyConfig }): Client {
+  const { securityPolicy } = deps;
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
 
   client.once(Events.ClientReady, readyClient => {
@@ -48,6 +50,51 @@ export function createDiscordBot(deps: DiscordDeps): Client {
 
   client.on(Events.InteractionCreate, async interaction => {
     try {
+      // Always ignore bot-authored interactions (bots cannot send slash commands,
+      // but guard defensively).
+      if (interaction.user.bot) {
+        return;
+      }
+
+      // Evaluate gateway security policy before any command handling.
+      const actorIdHash = hashDiscordId(interaction.user.id, deps.config);
+      const channelId = interaction.channelId ?? interaction.user.id;
+      const chatIdHash = hashDiscordId(channelId, deps.config);
+      const isGuild = Boolean(interaction.guildId);
+      const chatType = isGuild ? "guild" as const : "private" as const;
+
+      const decision = evaluatePolicy(
+        {
+          platform: "discord",
+          actorIdHash,
+          chatIdHash,
+          chatType,
+          isCommand: true,
+          commandName: interaction.isChatInputCommand() ? interaction.options.getSubcommandGroup(false) ?? interaction.options.getSubcommand(false) ?? undefined : undefined,
+          botWasMentioned: false,
+          messageAuthorIsBot: interaction.user.bot ?? false,
+          walletScopeRequested: isGuild ? "guild" : "user",
+          isCallbackQuery: interaction.isButton()
+        },
+        securityPolicy
+      );
+
+      if (decision.result === "deny_silent") {
+        return;
+      }
+      if (decision.result === "deny_with_dm_instruction") {
+        await replyToInteraction(interaction, "Use DM commands for private wallet operations.", true);
+        return;
+      }
+      if (decision.result === "deny_with_allowlist_message") {
+        await replyToInteraction(interaction, "This bot is restricted to approved users. Contact the operator to request access.", true);
+        return;
+      }
+      if (decision.result === "require_pairing") {
+        await replyToInteraction(interaction, "You need to pair your account first. DM the bot to get a pairing code.", true);
+        return;
+      }
+
       if (interaction.isChatInputCommand() && interaction.commandName === "ac") {
         await handleSlashCommand(interaction, deps);
         return;

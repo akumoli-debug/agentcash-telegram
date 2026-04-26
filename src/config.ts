@@ -79,6 +79,29 @@ const envSchema = z
       .transform(value => value === true || value === "true"),
     REMOTE_SIGNER_URL: z.string().url().optional(),
     PENDING_CONFIRMATION_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+    // Gateway security: allowlists, pairing, group-mention requirements.
+    // Raw platform user IDs (comma-separated). Hashed at startup using the master key.
+    GATEWAY_ALLOWED_USERS: z.string().default(""),
+    TELEGRAM_ALLOWED_USERS: z.string().default(""),
+    DISCORD_ALLOWED_USERS: z.string().default(""),
+    GATEWAY_ALLOW_ALL_USERS: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
+    PAIRING_MODE: z.enum(["disabled", "dm_code"]).default("disabled"),
+    PAIRING_CODE_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+    // When true, plain group text messages require a bot @mention before routing.
+    TELEGRAM_GROUP_REQUIRE_MENTION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("true")
+      .transform(value => value === true || value === "true"),
+    // Slash commands always pass. Natural language in guilds requires @mention by default.
+    DISCORD_GUILD_REQUIRE_MENTION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("true")
+      .transform(value => value === true || value === "true"),
+    // Comma-separated hashed chat IDs that bypass the require-mention rule.
+    GROUP_FREE_RESPONSE_CHAT_IDS: z.string().default(""),
     RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().int().positive().default(30),
     RATE_LIMIT_MAX_PER_HOUR: z.coerce.number().int().positive().default(100),
     RATE_LIMIT_QUOTE_MAX_PER_MINUTE: z.coerce.number().int().positive().default(8),
