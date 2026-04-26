@@ -1,15 +1,27 @@
 services:
-  agentcash-bot:
+  app:
     build:
       context: .
     env_file:
       - .env
     environment:
       NODE_ENV: production
+      DATABASE_PROVIDER: sqlite
       DATABASE_PATH: /app/.data/agentcash-telegram.db
+      ALLOW_SQLITE_IN_PRODUCTION: "true"
+      DATABASE_URL: postgres://agentcash:agentcash@postgres:5432/agentcash
+      LOCK_PROVIDER: redis
+      REDIS_URL: redis://redis:6379
+      AUDIT_SINK: file
+      AUDIT_FILE_PATH: /app/.data/audit-events.jsonl
       AGENTCASH_HOME_ROOT: /app/data/agentcash-homes
       HEALTH_HOST: 0.0.0.0
       HEALTH_PORT: 3001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "3000:3000"
       - "3001:3001"
@@ -30,6 +42,39 @@ services:
       retries: 3
       start_period: 15s
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agentcash
+      POSTGRES_USER: agentcash
+      POSTGRES_PASSWORD: agentcash
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentcash -d agentcash"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  audit-sink-mock:
+    image: mendhak/http-https-echo:35
+    profiles: ["audit-mock"]
+    ports:
+      - "8080:8080"
+
 volumes:
   agentcash-data:
   agentcash-homes:
+  postgres-data:
+  redis-data:

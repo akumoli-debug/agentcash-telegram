@@ -1,0 +1,33 @@
+flowchart LR
+  user["Telegram / Discord user"]
+  telegram["Telegram adapter"]
+  discord["Discord adapter"]
+  handlers["Command handlers"]
+  rate["Rate limits + freeze checks"]
+  wallets["WalletManager"]
+  executor["SkillExecutor"]
+  quotes["Quotes / transactions"]
+  locks["LockManager"]
+  custody["Signer boundary"]
+  agentcash["AgentCash CLI"]
+  paid["Paid x402 / MPP APIs"]
+  audit["Audit events"]
+  health["Health / readiness"]
+
+  user --> telegram
+  user --> discord
+  telegram --> handlers
+  discord --> handlers
+  handlers --> rate
+  rate --> wallets
+  rate --> executor
+  executor --> locks
+  executor --> quotes
+  executor --> custody
+  custody --> agentcash
+  agentcash --> paid
+  handlers --> audit
+  executor --> audit
+  health --> quotes
+  health --> locks
+  health --> custody

@@ -1,0 +1,25 @@
+flowchart TB
+  wallet["Wallet reference"]
+  signer["Signer interface"]
+  localcli["local_cli\nDemo only"]
+  localenc["local_encrypted\nLocal experiment"]
+  remote["remote_signer\nProduction-intended path"]
+  kms["kms\nProduction-intended stub"]
+  cli["Trusted AgentCash CLI subprocess"]
+  encrypted["Encrypted local key material"]
+  service["Remote signing service"]
+  provider["KMS / HSM provider"]
+
+  wallet --> signer
+  signer --> localcli
+  signer --> localenc
+  signer --> remote
+  signer --> kms
+  localcli --> cli
+  localenc --> encrypted
+  remote --> service
+  kms --> provider
+
+  localcli -. "not production-ready custody" .-> signer
+  remote -. "requires implementation and review" .-> signer
+  kms -. "requires implementation and review" .-> signer

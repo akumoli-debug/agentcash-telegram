@@ -60,6 +60,10 @@ function makeWalletRow(overrides: Partial<WalletRow> = {}): WalletRow {
     address: "0xABCDEF1234567890",
     network: "base",
     deposit_link: null,
+    wallet_ref: "testhash",
+    signer_backend: "local_cli",
+    public_address: "0xABCDEF1234567890",
+    active_key_version: 1,
     encrypted_private_key: "v1.iv.tag.ct",
     status: "active",
     created_at: new Date().toISOString(),
@@ -238,7 +242,7 @@ describe("Phase 2 - Immutable quote records", () => {
 
     const quotes = db.sqlite.prepare("SELECT * FROM quotes").all() as Array<{ status: string }>;
     expect(quotes).toHaveLength(1);
-    expect(quotes[0]!.status).toBe("executed");
+    expect(quotes[0]!.status).toBe("succeeded");
   });
 });
 
@@ -269,7 +273,7 @@ describe("Phase 3 - Confirm replay protection", () => {
     expect(fetchJson).toHaveBeenCalledTimes(1);
 
     const quote = db.getQuote(result.quoteId)!;
-    expect(quote.status).toBe("executed");
+    expect(quote.status).toBe("succeeded");
   });
 
   it("confirm replay does not execute twice", async () => {

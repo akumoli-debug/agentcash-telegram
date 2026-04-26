@@ -1,0 +1,35 @@
+sequenceDiagram
+  participant User
+  participant Chat as Chat adapter
+  participant Executor as SkillExecutor
+  participant DB as Quotes DB
+  participant AC as AgentCash CLI
+  participant API as Paid API
+
+  User->>Chat: /research query
+  Chat->>Executor: skill + canonical input
+  Executor->>AC: check endpoint / estimate cost
+  AC-->>Executor: quoted cost
+  Executor->>DB: create quote(status=pending)
+  alt below cap and no forced confirmation
+    Executor->>DB: transition pending -> approved -> executing
+    Executor->>AC: fetch with stored request
+    AC->>API: paid call
+    API-->>AC: result
+    AC-->>Executor: result + cost
+    Executor->>DB: transaction + quote succeeded
+  else confirmation required
+    Executor-->>Chat: quote confirmation button
+    User->>Chat: confirm
+    Chat->>DB: approve quote if status=pending
+    Chat->>Executor: execute stored quote
+    Executor->>DB: transition approved -> executing
+    Executor->>AC: fetch with stored request
+    AC->>API: paid call
+    API-->>AC: result
+    AC-->>Executor: result + cost
+    Executor->>DB: transaction + quote succeeded
+  end
+  User->>Chat: replay same button
+  Chat->>DB: transition fails
+  Chat-->>User: replay rejected

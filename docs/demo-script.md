@@ -1,133 +1,232 @@
 # Demo Script
 
-## Goal
+This script is designed for a v0.1 evaluator demo. It should be honest about what is live, what is dry-run verified, and what is not production-ready custody.
 
-Show the smallest useful AgentCash Telegram loop:
+## Commands To Prepare
 
-1. fund once
-2. call paid APIs from chat
-3. keep spend controls explicit
+```bash
+corepack pnpm install
+corepack pnpm format
+corepack pnpm lint
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+corepack pnpm smoke:dry
+corepack pnpm release:check
+```
 
-## Before the demo
+For live smoke:
 
-- start the bot locally with `corepack pnpm dev`
-- fund a demo wallet or be ready to show the deposit flow
-- have Telegram open on desktop or mobile
+```bash
+corepack pnpm smoke:agentcash
+corepack pnpm smoke:live -- --no-funds
+corepack pnpm dev
+```
 
-## Script
+## 60-Second Version
 
-### 1. Start
+Say:
 
-Send:
+> agentcash-telegram is a chat-native spend-control layer for paid agent/API calls. The product idea is simple: fund once, quote every paid call, enforce caps, confirm risky spend, and keep an audit trail from chat.
+
+Show:
+
+1. README status table and the "not production-ready custody" section.
+2. `corepack pnpm smoke:dry` output.
+3. Telegram private chat:
 
 ```text
 /start
-```
-
-What to say:
-
-- this provisions or loads a wallet for this Telegram user only
-- the deposit address comes back immediately
-
-Placeholder capture:
-
-- `docs/assets/start.png`
-
-### 2. Deposit
-
-Send:
-
-```text
 /deposit
-```
-
-What to say:
-
-- this shows the wallet funding QR and deposit link
-- the wallet is isolated per Telegram user
-
-Placeholder capture:
-
-- `docs/assets/deposit.png`
-
-### 3. Balance
-
-Send:
-
-```text
 /balance
-```
-
-What to say:
-
-- this checks the AgentCash wallet balance
-- it also shows the active spend cap state
-
-Placeholder capture:
-
-- `docs/assets/balance.png`
-
-### 4. Research
-
-Send:
-
-```text
+/cap 0.25
 /research latest x402 ecosystem activity
+/history
 ```
 
-What to say:
+Say:
 
-- the bot estimates cost, checks balance, and uses the shared paid execution pipeline
-- calls above the cap require confirmation
+> The stable MVP surface is Telegram private wallets. Group wallets, inline mode, and Discord are implemented and tested, but labeled experimental until live smoke evidence is captured.
 
-Placeholder capture:
+## 90-Second Version
 
-- `docs/assets/research.png`
+Start with the 60-second flow, then add the safety model:
 
-### 5. Enrich
+1. Open [docs/diagrams/quote_flow.mmd](diagrams/quote_flow.mmd).
+2. Explain that paid execution uses stored quote records, not re-parsed chat text.
+3. Show one confirmation and then replay the same button.
+4. Show that the replay is rejected.
+5. Run:
 
-Send:
+```bash
+corepack pnpm test
+corepack pnpm smoke:dry
+```
+
+Say:
+
+> The important part is not that chat can call an API. The important part is that chat spend is quoted, capped, confirmed, and auditable.
+
+## 3-Minute Technical Version
+
+1. Show the architecture diagram:
+
+```bash
+sed -n '1,220p' docs/diagrams/architecture.mmd
+```
+
+2. Show the quote flow:
+
+```bash
+sed -n '1,220p' docs/diagrams/quote_flow.mmd
+```
+
+3. Show custody boundary:
+
+```bash
+sed -n '1,220p' docs/custody-review.md
+sed -n '1,220p' src/custody/signer.ts
+```
+
+4. Show operational readiness:
+
+```bash
+sed -n '1,220p' docs/readiness.md
+sed -n '1,220p' docs/deployment.md
+```
+
+5. Run:
+
+```bash
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm smoke:dry
+corepack pnpm release:check
+```
+
+Say:
+
+> This is intentionally not called production custody. The v0.1 release proves the spend-control product shape and gives clear seams for production storage, distributed locking, and signer work.
+
+## Exact Telegram Messages
+
+Private wallet:
 
 ```text
-/enrich jane@example.com
+/start
+/deposit
+/balance
+/cap 0.25
+/research latest x402 ecosystem activity
+/history
+/freeze
+/status
+/unfreeze
 ```
 
-What to say:
-
-- this uses the deterministic enrichment endpoint
-- the bot returns concise fields rather than dumping raw provider output
-
-Placeholder capture:
-
-- `docs/assets/enrich.png`
-
-### 6. Generate
-
-Send:
+Group wallet, from a Telegram group creator/admin:
 
 ```text
-/generate lobster wearing a tuxedo
+/groupwallet create
+/groupwallet sync-admins
+/groupwallet roles
+/groupwallet balance
+/groupwallet cap 0.25
+/groupwallet history
 ```
 
-What to say:
-
-- image generation uses the same wallet, cap, and confirmation controls
-- if the upstream API returns an image URL, the bot sends the image back into Telegram
-
-Placeholder capture:
-
-- `docs/assets/generate.png`
-- `docs/assets/demo.gif`
-
-## Optional natural language demo
-
-If `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is configured, send:
+Group wallet negative checks:
 
 ```text
-make an image of a lobster in a tuxedo
+/groupwallet create
+/groupwallet cap 0.25
 ```
 
-What to say:
+Run those from a non-admin account and confirm they are refused.
 
-- natural language routing is optional
-- it never auto-pays without showing confirmation first
+Inline mode, if enabled in BotFather:
+
+```text
+@<bot username> research latest x402 ecosystem activity
+```
+
+Verify the inline result is only a preview and does not execute a paid call until opened and confirmed.
+
+## Exact Discord Commands
+
+DM/user wallet:
+
+```text
+/ac wallet balance
+/ac wallet deposit
+/ac wallet cap amount:0.25
+/ac wallet research query:latest x402 ecosystem activity
+/ac wallet history
+/ac wallet freeze
+/ac wallet status
+/ac wallet unfreeze
+```
+
+Guild wallet, from a member with Manage Server or Administrator:
+
+```text
+/ac guild create
+/ac guild sync-admins
+/ac guild balance
+/ac guild deposit
+/ac guild cap amount:0.25
+/ac guild research query:latest x402 ecosystem activity
+/ac guild history
+/ac guild freeze
+/ac guild status
+/ac guild unfreeze
+```
+
+Guild negative check:
+
+```text
+/ac guild create
+```
+
+Run it from a member without Manage Server or Administrator and confirm it is refused.
+
+## If AgentCash CLI Fails
+
+Say:
+
+> This demo depends on the local AgentCash CLI for live quote and execution. The dry-run harness proves the app wiring without credentials or funds. The CLI failure means we should not claim a live paid-call pass for this run.
+
+Then show:
+
+```bash
+corepack pnpm smoke:dry
+corepack pnpm test
+```
+
+Record the failure in the live smoke notes with the exact command, timestamp, commit SHA, and error message.
+
+## Custody Limitation Talk Track
+
+Say:
+
+> This repo is not production-ready custody. The local CLI path is demo-only. The code now has a signer boundary so future remote signer or KMS work does not require passing raw keys through product code, but that production signer is not implemented or reviewed here.
+
+Do not say:
+
+- "production custody is solved"
+- "KMS is integrated"
+- "Postgres production is complete"
+- "Redis locking makes duplicate spend impossible"
+
+## Evidence To Capture
+
+- Commit SHA.
+- Date and environment.
+- `corepack pnpm test` result.
+- `corepack pnpm smoke:dry` result.
+- Whether `corepack pnpm smoke:agentcash` passed.
+- Telegram private live smoke result.
+- Telegram group live smoke result.
+- Discord DM live smoke result.
+- Discord guild live smoke result.
+- Whether real funds were used.

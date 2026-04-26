@@ -192,11 +192,7 @@ export async function runSkillCommand(
 }
 
 export function ensureSupportedWalletScope(ctx: CommandContext): void {
-  if (ctx.platform === "discord" && ctx.walletScope.kind === "guild") {
-    throw new ValidationError(
-      "Discord MVP currently supports user wallets only. Guild wallets need an explicit create flow before paid calls can run."
-    );
-  }
+  void ctx;
 }
 
 function assertUserWalletScope(ctx: CommandContext): void {

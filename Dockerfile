@@ -15,6 +15,7 @@ FROM deps AS build
 COPY tsconfig.json ./
 COPY scripts ./scripts
 COPY src ./src
+COPY migrations ./migrations
 RUN corepack pnpm typecheck
 
 FROM node:24-bookworm-slim AS runtime
@@ -30,6 +31,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY src ./src
 COPY scripts ./scripts
+COPY migrations ./migrations
 COPY tsconfig.json ./
 
 RUN mkdir -p /app/.data /app/data/agentcash-homes \

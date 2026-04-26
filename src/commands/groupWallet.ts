@@ -1,8 +1,14 @@
 import type { Context } from "telegraf";
 import { z } from "zod";
 import type { AppConfig } from "../config.js";
-import type { AppDatabase, HistoryEntry } from "../db/client.js";
+import type { AppDatabase, GroupMemberRow, GroupRow, HistoryEntry, UserRow } from "../db/client.js";
 import { ValidationError } from "../lib/errors.js";
+import {
+  assertTelegramGroupAdmin,
+  getTelegramMemberStatus,
+  isAdminStatus,
+  listTelegramGroupAdmins
+} from "../telegram/adminVerifier.js";
 import { WalletManager } from "../wallets/walletManager.js";
 import { formatUsdAmount, getCommandArgument } from "./helpers.js";
 import { replyWithError } from "./replyWithError.js";
@@ -23,7 +29,7 @@ export function createGroupWalletCommand(deps: {
         throw new ValidationError("Could not identify this Telegram conversation.");
       }
 
-      if (chat.type === "private") {
+      if (chat.type !== "group" && chat.type !== "supergroup") {
         await ctx.reply("Group wallet commands must be run inside a Telegram group.");
         return;
       }
@@ -39,11 +45,56 @@ export function createGroupWalletCommand(deps: {
       }
 
       if (subcommand === "create") {
+        const telegramStatus = await assertTelegramGroupAdmin(ctx, chatId, userId);
+        const existingGroup = deps.db.getGroupByTelegramChatHash(
+          WalletManager.getHashedChatId(chatId, deps.config.MASTER_ENCRYPTION_KEY)
+        );
+
+        if (existingGroup) {
+          const existingContext = await deps.walletManager.getGroupWalletForTelegramChat(chatId, userId);
+          if (!existingContext?.group) {
+            await ctx.reply("No group wallet exists yet. Run /groupwallet create in this group first.");
+            return;
+          }
+
+          deps.db.recordTelegramAdminVerification({
+            groupId: existingContext.group.id,
+            userId: existingContext.user.id,
+            telegramStatus,
+            source: "getChatMember"
+          });
+
+          if (await ownerNeedsAdminSync(ctx, deps, chatId, existingContext.group)) {
+            await ctx.reply(
+              "This group wallet already exists, but its original owner is no longer a Telegram admin. Ask a current Telegram admin to run /groupwallet sync-admins."
+            );
+            return;
+          }
+
+          await ctx.reply(
+            [
+              "Group wallet already exists.",
+              "No owner was changed.",
+              "Run /groupwallet sync-admins after Telegram admin changes."
+            ].join("\n")
+          );
+          return;
+        }
+
         const result = await deps.walletManager.getOrCreateGroupWallet({
           chatId,
           title: "title" in chat ? chat.title : null,
           createdByTelegramId: userId
         });
+
+        if (result.group) {
+          deps.db.recordTelegramAdminVerification({
+            groupId: result.group.id,
+            userId: result.user.id,
+            telegramStatus,
+            source: "getChatMember"
+          });
+        }
 
         deps.db.upsertSession({
           userId: result.user.id,
@@ -113,17 +164,34 @@ export function createGroupWalletCommand(deps: {
         return;
       }
 
-      if (subcommand === "members") {
+      if (subcommand === "members" || subcommand === "roles") {
         const summaries = deps.db.getGroupMemberSummaries(groupContext.group.id);
         const roleCounts = new Map(summaries.map(entry => [entry.role, entry.count]));
 
         await ctx.reply(
           [
-            "Group wallet members:",
+            "Group wallet roles:",
             `Owners: ${roleCounts.get("owner") ?? 0}`,
             `Admins: ${roleCounts.get("admin") ?? 0}`,
             `Members: ${roleCounts.get("member") ?? 0}`,
-            "Members are added when they interact with the group wallet."
+            "Role model: the original creator is owner; Telegram admins sync to internal admins; other interacting users are members.",
+            "Telegram admins control group wallet admin rights. Run /groupwallet sync-admins after admin changes."
+          ].join("\n")
+        );
+        return;
+      }
+
+      if (subcommand === "sync-admins") {
+        await assertFreshTelegramAdmin(ctx, deps, groupContext.group, groupContext.user, chatId);
+        const result = await syncTelegramAdmins(ctx, deps, groupContext.group, chatId);
+
+        await ctx.reply(
+          [
+            "Group wallet admin sync complete.",
+            `Known Telegram admins promoted: ${result.promoted}`,
+            `Internal admins demoted: ${result.demoted}`,
+            `Known Telegram admins verified: ${result.verified}`,
+            `Telegram admins not known to the bot: ${result.unknownAdmins}`
           ].join("\n")
         );
         return;
@@ -141,10 +209,6 @@ export function createGroupWalletCommand(deps: {
       }
 
       if (subcommand === "cap") {
-        if (!deps.walletManager.isGroupAdmin(groupContext.group.id, groupContext.user.id)) {
-          throw new ValidationError("Only a group wallet owner or admin can change the group cap.");
-        }
-
         const rawAmount = rest.join(" ").trim();
         if (!rawAmount || rawAmount.toLowerCase() === "show") {
           await ctx.reply(
@@ -156,6 +220,7 @@ export function createGroupWalletCommand(deps: {
         }
 
         if (rawAmount.toLowerCase() === "off") {
+          await assertInternalAndFreshTelegramAdmin(ctx, deps, groupContext.group, groupContext.user, chatId);
           deps.walletManager.updateGroupCap(groupContext.group.id, { enabled: false });
           await ctx.reply(
             [
@@ -176,6 +241,8 @@ export function createGroupWalletCommand(deps: {
             `For MVP, caps above ${formatUsdAmount(deps.config.HARD_SPEND_CAP_USDC)} are disabled.`
           );
         }
+
+        await assertInternalAndFreshTelegramAdmin(ctx, deps, groupContext.group, groupContext.user, chatId);
 
         deps.walletManager.updateGroupCap(groupContext.group.id, {
           amount: parsed.data,
@@ -205,12 +272,146 @@ async function replyWithGroupWalletHelp(ctx: Context): Promise<void> {
       "/groupwallet create",
       "/groupwallet deposit",
       "/groupwallet balance",
-      "/groupwallet members",
+      "/groupwallet roles",
+      "/groupwallet sync-admins",
       "/groupwallet history",
       "/groupwallet cap <amount>",
       "/groupwallet help"
     ].join("\n")
   );
+}
+
+async function assertInternalAndFreshTelegramAdmin(
+  ctx: Context,
+  deps: { db: AppDatabase; walletManager: WalletManager },
+  group: GroupRow,
+  user: UserRow,
+  chatId: string
+): Promise<void> {
+  if (!deps.walletManager.isGroupAdmin(group.id, user.id)) {
+    throw new ValidationError("Only a group wallet owner or admin can change group wallet admin settings.");
+  }
+
+  const telegramStatus = await assertTelegramGroupAdmin(ctx, chatId, user.telegram_user_id);
+  deps.db.recordTelegramAdminVerification({
+    groupId: group.id,
+    userId: user.id,
+    telegramStatus,
+    source: "getChatMember"
+  });
+
+  if (!deps.db.hasFreshTelegramAdminVerification(group.id, user.id)) {
+    throw new ValidationError("Telegram admin verification is stale. Run /groupwallet sync-admins and try again.");
+  }
+}
+
+async function assertFreshTelegramAdmin(
+  ctx: Context,
+  deps: { db: AppDatabase },
+  group: GroupRow,
+  user: UserRow,
+  chatId: string
+): Promise<void> {
+  const telegramStatus = await assertTelegramGroupAdmin(ctx, chatId, user.telegram_user_id);
+  deps.db.recordTelegramAdminVerification({
+    groupId: group.id,
+    userId: user.id,
+    telegramStatus,
+    source: "getChatMember"
+  });
+}
+
+async function ownerNeedsAdminSync(
+  ctx: Context,
+  deps: { db: AppDatabase },
+  chatId: string,
+  group: GroupRow
+): Promise<boolean> {
+  const owner = deps.db.getUserById(group.created_by_user_id);
+  if (!owner) {
+    return true;
+  }
+
+  const status = await getTelegramMemberStatus(ctx, chatId, owner.telegram_user_id);
+  return !isAdminStatus(status);
+}
+
+async function syncTelegramAdmins(
+  ctx: Context,
+  deps: { db: AppDatabase },
+  group: GroupRow,
+  chatId: string
+): Promise<{ promoted: number; demoted: number; verified: number; unknownAdmins: number }> {
+  const telegramAdmins = await listTelegramGroupAdmins(ctx, chatId);
+  const adminTelegramIds = new Set(telegramAdmins.map(admin => admin.userId));
+  let promoted = 0;
+  let demoted = 0;
+  let verified = 0;
+  let unknownAdmins = 0;
+
+  for (const admin of telegramAdmins) {
+    const user = deps.db.getUserByTelegramId(admin.userId);
+    if (!user) {
+      unknownAdmins += 1;
+      continue;
+    }
+
+    deps.db.recordTelegramAdminVerification({
+      groupId: group.id,
+      userId: user.id,
+      telegramStatus: admin.status,
+      source: "getChatAdministrators"
+    });
+    verified += 1;
+
+    const targetRole: GroupMemberRow["role"] =
+      user.id === group.created_by_user_id ? "owner" : "admin";
+    const result = deps.db.updateGroupMemberRole(group.id, user.id, targetRole);
+    if (result.changed && result.previousRole !== "owner") {
+      promoted += 1;
+      deps.db.createAuditEvent({
+        eventName: "group_admin.promoted",
+        groupId: group.id,
+        actorHash: user.id,
+        status: targetRole,
+        metadata: { source: "sync-admins" }
+      });
+    }
+  }
+
+  for (const member of deps.db.getGroupMembers(group.id)) {
+    if (member.role !== "owner" && member.role !== "admin") {
+      continue;
+    }
+
+    const user = deps.db.getUserById(member.user_id);
+    if (!user) {
+      continue;
+    }
+
+    if (member.role === "owner" && member.user_id === group.created_by_user_id) {
+      const ownerStatus = await getTelegramMemberStatus(ctx, chatId, user.telegram_user_id);
+      if (ownerStatus !== "left" && ownerStatus !== "kicked") {
+        continue;
+      }
+    } else if (adminTelegramIds.has(user.telegram_user_id)) {
+      continue;
+    }
+
+    const result = deps.db.updateGroupMemberRole(group.id, member.user_id, "member");
+    if (result.changed) {
+      demoted += 1;
+      deps.db.createAuditEvent({
+        eventName: "group_admin.demoted",
+        groupId: group.id,
+        actorHash: member.user_id,
+        status: "member",
+        metadata: { source: "sync-admins" }
+      });
+    }
+  }
+
+  return { promoted, demoted, verified, unknownAdmins };
 }
 
 function formatHistoryEntry(entry: HistoryEntry, index: number): string {

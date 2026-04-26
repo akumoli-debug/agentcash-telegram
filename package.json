@@ -16,20 +16,28 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "smoke:wallets": "node scripts/smoke-wallets.mjs --print-only 10001 10002"
+    "db:migrate": "tsx scripts/db-migrate.ts",
+    "smoke:wallets": "node scripts/smoke-wallets.mjs --print-only 10001 10002",
+    "smoke:dry": "tsx scripts/smoke-live.ts --dry-run",
+    "smoke:agentcash": "tsx scripts/smoke-live.ts --agentcash",
+    "smoke:live": "tsx scripts/smoke-live.ts --telegram --discord --agentcash",
+    "release:check": "tsx scripts/release-check.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",
     "discord.js": "^14.26.3",
     "dotenv": "^17.2.3",
+    "pg": "^8.20.0",
     "pino": "^9.7.0",
     "pino-pretty": "^13.1.1",
     "qrcode": "^1.5.4",
+    "redis": "^5.12.1",
     "telegraf": "^4.16.3",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",
+    "@types/pg": "^8.20.0",
     "@types/qrcode": "^1.5.5",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",

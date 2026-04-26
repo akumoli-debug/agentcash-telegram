@@ -2,6 +2,7 @@ import { config as loadDotEnv } from "dotenv";
 import { z } from "zod";
 import { ConfigError } from "./lib/errors.js";
 import { decodeMasterKey } from "./lib/crypto.js";
+import { validateProductionConfig } from "./configValidation.js";
 
 loadDotEnv();
 
@@ -11,8 +12,32 @@ const envSchema = z
     TELEGRAM_BOT_USERNAME: z.string().trim().optional(),
     DISCORD_BOT_TOKEN: z.string().trim().optional(),
     DISCORD_APPLICATION_ID: z.string().trim().optional(),
+    DISCORD_DEV_GUILD_ID: z.string().trim().optional(),
+    DATABASE_PROVIDER: z.enum(["sqlite", "postgres"]).default("sqlite"),
     DATABASE_PATH: z.string().default(".data/agentcash-telegram.db"),
+    DATABASE_URL: z.string().trim().optional(),
+    ALLOW_SQLITE_IN_PRODUCTION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
+    LOCK_PROVIDER: z.enum(["local", "redis"]).default("local"),
+    REDIS_URL: z.string().trim().optional(),
+    ALLOW_LOCAL_LOCKS_IN_PRODUCTION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
+    AUDIT_SINK: z.enum(["database", "file", "http"]).default("database"),
+    AUDIT_FILE_PATH: z.string().default(".data/audit-events.jsonl"),
+    AUDIT_HTTP_ENDPOINT: z.string().url().optional(),
+    ALLOW_DATABASE_AUDIT_IN_PRODUCTION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+    ALLOW_VERBOSE_LOGS_IN_PRODUCTION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     BOT_MODE: z.enum(["polling", "webhook"]).default("polling"),
     WEBHOOK_DOMAIN: z.string().trim().optional(),
@@ -21,7 +46,7 @@ const envSchema = z
     WEBHOOK_PORT: z.coerce.number().int().positive().default(3000),
     WEBHOOK_SECRET_TOKEN: z.string().trim().optional(),
     HEALTH_HOST: z.string().default("0.0.0.0"),
-    HEALTH_PORT: z.coerce.number().int().positive().default(3001),
+    HEALTH_PORT: z.coerce.number().int().min(0).default(3001),
     AGENTCASH_COMMAND: z.string().default("npx"),
     AGENTCASH_ARGS: z.string().default("agentcash@latest"),
     AGENTCASH_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
@@ -35,9 +60,26 @@ const envSchema = z
       .union([z.literal("true"), z.literal("false"), z.boolean()])
       .default("false")
       .transform(value => value === true || value === "true"),
+    SKIP_AGENTCASH_HEALTHCHECK: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
+    CUSTODY_MODE: z
+      .enum(["local_cli", "local_encrypted", "remote_signer", "kms"])
+      .default("local_cli"),
+    ALLOW_INSECURE_LOCAL_CUSTODY: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
+    REMOTE_SIGNER_URL: z.string().url().optional(),
     PENDING_CONFIRMATION_TTL_SECONDS: z.coerce.number().int().positive().default(300),
     RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().int().positive().default(30),
     RATE_LIMIT_MAX_PER_HOUR: z.coerce.number().int().positive().default(100),
+    RATE_LIMIT_QUOTE_MAX_PER_MINUTE: z.coerce.number().int().positive().default(8),
+    RATE_LIMIT_PAID_EXECUTION_MAX_PER_MINUTE: z.coerce.number().int().positive().default(3),
+    RATE_LIMIT_REPLAY_MAX_PER_HOUR: z.coerce.number().int().positive().default(10),
+    GLOBAL_PAID_CALL_CONCURRENCY: z.coerce.number().int().positive().default(4),
+    GROUP_DAILY_CAP_USDC: z.coerce.number().positive().default(25),
     AGENTCASH_HOME_ROOT: z.string().default("data/agentcash-homes"),
     OPENAI_API_KEY: z.string().trim().optional(),
     OPENAI_ROUTER_MODEL: z.string().default("gpt-5.4-mini"),
@@ -67,6 +109,22 @@ const envSchema = z
       });
     }
 
+    if (values.DATABASE_PROVIDER === "postgres" && !values.DATABASE_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "DATABASE_URL is required when DATABASE_PROVIDER=postgres",
+        path: ["DATABASE_URL"]
+      });
+    }
+
+    if (values.LOCK_PROVIDER === "redis" && !values.REDIS_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "REDIS_URL is required when LOCK_PROVIDER=redis",
+        path: ["REDIS_URL"]
+      });
+    }
+
     if (values.BOT_MODE === "webhook" && !values.WEBHOOK_DOMAIN) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -82,23 +140,68 @@ const envSchema = z
         path: ["WEBHOOK_SECRET_TOKEN"]
       });
     }
+
+    if (values.CUSTODY_MODE === "remote_signer" && !values.REMOTE_SIGNER_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "REMOTE_SIGNER_URL is required when CUSTODY_MODE=remote_signer",
+        path: ["REMOTE_SIGNER_URL"]
+      });
+    }
+
+    if (values.AUDIT_SINK === "http" && !values.AUDIT_HTTP_ENDPOINT) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "AUDIT_HTTP_ENDPOINT is required when AUDIT_SINK=http",
+        path: ["AUDIT_HTTP_ENDPOINT"]
+      });
+    }
   });
 
 export type AppConfig = z.infer<typeof envSchema> & {
   agentcashArgs: string[];
 };
 
-export function getConfig(): AppConfig {
-  const parsed = envSchema.safeParse(process.env);
+export function parseConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const parsed = envSchema.safeParse(env);
 
   if (!parsed.success) {
-    throw new ConfigError("Invalid environment configuration", parsed.error.flatten());
+    const firstIssue = parsed.error.issues[0]?.message;
+    throw new ConfigError(
+      firstIssue ? `Invalid environment configuration: ${firstIssue}` : "Invalid environment configuration",
+      parsed.error.flatten()
+    );
   }
 
   const values = parsed.data;
+  validateParsedProductionConfig(values, env);
 
   return {
     ...values,
     agentcashArgs: values.AGENTCASH_ARGS.split(" ").map(part => part.trim()).filter(Boolean)
   };
+}
+
+function validateParsedProductionConfig(values: z.infer<typeof envSchema>, env: NodeJS.ProcessEnv) {
+  const issues: z.ZodIssue[] = [];
+  validateProductionConfig(
+    values,
+    {
+      addIssue(issue) {
+        issues.push(issue as z.ZodIssue);
+      }
+    },
+    env
+  );
+
+  if (issues.length > 0) {
+    throw new ConfigError(`Invalid environment configuration: ${issues[0]!.message}`, {
+      formErrors: [],
+      fieldErrors: Object.fromEntries(issues.map(issue => [issue.path.join("."), [issue.message]]))
+    });
+  }
+}
+
+export function getConfig(): AppConfig {
+  return parseConfig(process.env);
 }

@@ -33,7 +33,7 @@ Before any confirmation or execution, a `quotes` record is created with:
 - `request_hash` — HMAC of the canonical request
 - `quoted_cost_cents` — cost from AgentCash CLI check
 - `max_approved_cost_cents` — approved quote ceiling stored with the quote for audit and execution policy checks
-- `status` — `pending → approved → executed` (or `expired / cancelled / failed`)
+- `status` — `pending → approved → executing → succeeded` (or `expired / canceled / failed`)
 - `expires_at` — immutable TTL set at creation
 - `requester_user_id` and optional `group_id` — durable requester and group context
 - `requires_group_admin_approval` — whether owner/admin approval is required
@@ -53,16 +53,64 @@ If 0 rows are changed, the confirm is rejected (replay protection). Execution th
 - Each Telegram user gets a distinct AgentCash wallet context.
 - Wallet home directories are named `<AGENTCASH_HOME_ROOT>/<user_hash>/` where `user_hash` is a keyed HMAC of the Telegram ID — never the raw Telegram ID.
 - Experimental roadmap group wallet home directories are named with a keyed HMAC of the chat ID, not the raw chat ID.
-- SQLite stores wallet metadata. Private key material is encrypted at rest with AES-256-GCM using `MASTER_ENCRYPTION_KEY`.
+- SQLite stores wallet metadata. Local/demo private key material is encrypted at rest with AES-256-GCM using `MASTER_ENCRYPTION_KEY`.
+- Wallet rows include custody metadata: `wallet_ref`, `signer_backend`, `public_address`, and `active_key_version`.
 - Wallet provisioning is idempotent: if the wallet row exists and is active, the CLI is not called again.
 - If a new encrypted key is returned from the CLI but a different key already exists in the database, provisioning refuses with an error rather than silently overwriting.
 
+---
+
+## Custody boundary
+
+Custody is abstracted behind `src/custody/signer.ts`.
+
+| Mode | Status |
+|---|---|
+| `local_cli` | Demo only. Wraps current AgentCash CLI behavior and isolates decrypted key env passing inside `LocalCliSigner`. |
+| `local_encrypted` | Experimental local boundary; not production-intended. |
+| `remote_signer` | Future production path for a separate signer service. |
+| `kms` | Future KMS/HSM path; currently fails closed with a clear error. |
+
+Production startup rejects `CUSTODY_MODE=local_cli` unless `ALLOW_INSECURE_LOCAL_CUSTODY=true` is explicitly set and a large warning is logged. Production also rejects `local_encrypted`.
+
+`AgentCashClient` does not import key decrypt helpers. It can still execute the CLI only when the signer backend is `LocalCliSigner`.
+
+---
+
+## Telegram-admin-gated group wallets
+
+Group wallets are experimental but no longer rely only on first-writer database roles.
+
+Admin-sensitive group wallet actions require both:
+
+1. Internal `group_members.role IN ('owner', 'admin')`.
+2. Fresh Telegram verification that the actor is currently `creator` or `administrator`.
+
+Fresh verification is stored in `telegram_admin_verifications` with:
+
+- `group_id`
+- `user_id`
+- `verified_at`
+- `telegram_status`
+- `expires_at`
+- `source`
+
+The freshness window is 5 minutes. Stale internal roles are not enough to change group caps or approve over-cap group wallet quotes.
+
+Telegram statuses are interpreted as:
+
+- `creator`: admin
+- `administrator`: admin
+- `member`, `restricted`, `left`, `kicked`: not admin
+
+If Telegram verification fails, the action fails closed and tells the user to make the bot a group admin. The app does not silently allow admin actions when Telegram cannot be checked.
+
 ### AgentCash CLI dependency risk
 
-All CLI interactions are encapsulated in `agentcashClient.ts`. The CLI runs as a subprocess in the user's isolated home directory. This is the main operational risk:
+All demo CLI key handling is isolated in `LocalCliSigner`. The CLI runs as a subprocess in the user's isolated home directory. This is the main operational risk:
 
 - If the CLI is unavailable, startup fails with a clear error.
-- CLI errors can surface in application error messages.
+- Raw CLI stdout/stderr are not included in structured errors because they could contain sensitive data.
 - The CLI must be trusted — it receives the decrypted wallet private key via environment variable.
 - Key material is present in process memory only during CLI invocation.
 
@@ -132,26 +180,28 @@ No raw request bodies or user input is logged.
 - The `LockManager` interface serializes wallet provisioning, quote approval, and paid execution.
 - The default `LocalLockManager` is in-process only.
 - SQL-level atomic approve prevents double-execution even under concurrent callbacks.
+- Paid execution also requires an atomic `approved -> executing` quote transition and a unique transaction `idempotency_key`.
 - Session state stores only `quote_id`, not raw input. Confirm handler verifies the quote ID matches the session before proceeding.
-- Group wallets, inline mode, and Discord are roadmap/experimental code paths and are not part of the shipped Telegram private-chat MVP demo.
+- Group wallets, inline mode, and Discord are experimental code paths and are not part of the shipped Telegram private-chat MVP demo.
 
 ---
 
-## Roadmap group custody risks
+## Group custody risks
 
-Group wallets are not part of the shipped private-chat MVP demo. If enabled later, they concentrate shared funds under one bot-controlled wallet. Current experimental safeguards:
+Group wallets are not part of the shipped private-chat MVP demo. They concentrate shared funds under one bot-controlled wallet. Current experimental safeguards:
 
 - Group wallet creation is idempotent and uses `wallets.kind='group'`.
 - Raw Telegram chat IDs are hashed in group records.
 - Transactions record the acting requester user and the group wallet.
-- Non-admin members cannot change the group cap.
-- Over-cap quotes cannot be confirmed by arbitrary members.
+- Non-admin members cannot create the group wallet, change the group cap, or approve over-cap quotes.
+- Telegram admin status gates group wallet creation and high-risk admin actions.
+- `/groupwallet sync-admins` promotes/demotes local roles from Telegram's current admin list.
 
 Important limitations:
 
-- Telegram admin status is not synced automatically.
-- Only the creator becomes owner automatically; additional admins require a future role-management workflow or direct database update.
-- Owner/admin approval is enforced, but there is no full approval queue or quorum policy yet.
+- Telegram admin status is synced on command, not continuously in the background.
+- Telegram admins who have never interacted with the bot may be counted but cannot be mapped to an internal user row yet.
+- Owner/admin approval is enforced, but there is no full approval queue or quorum policy.
 - Any owner/admin can approve an over-cap call, so groups should keep low caps until role management is expanded.
 
 ---
@@ -161,13 +211,17 @@ Important limitations:
 | Risk | Current state |
 |---|---|
 | SQLite | Local only. Not suitable for distributed production. |
+| Postgres adapter | Migration/adapter exists, but full repository wiring is not complete. |
 | LocalLockManager | Per-process only. Multiple replicas = no cross-process locking. |
-| CLI subprocess trust | The CLI is trusted. It receives the decrypted private key. |
-| Key material in memory | Decrypted during CLI invocations. Not zeroed after use. |
-| `MASTER_ENCRYPTION_KEY` rotation | No rotation procedure exists. |
+| RedisLockManager | Coordination aid only. No lock renewal yet, and DB idempotency remains the source of truth. |
+| `local_cli` custody | Demo only. The CLI is trusted and receives the decrypted private key through `LocalCliSigner`. |
+| Key material in memory | Decrypted during local CLI invocations. Not zeroed after use. |
+| Remote signer/KMS | Interfaces and stubs exist, but no production signer is implemented. |
+| Key rotation | Local/demo key version audit exists; no automatic fund migration or production key rotation exists. |
+| `MASTER_ENCRYPTION_KEY` rotation | No tested rotation procedure exists. |
 | AgentCash CLI availability | If the CLI is broken or unavailable, no paid calls can proceed. |
 | Router traffic | If NL routing is enabled, non-slash user text is sent to OpenAI or Anthropic. |
-| Group role sync | Telegram admin status is not synced; only the creator is owner automatically. |
+| Group role sync | Telegram admin status is command-synced, not continuously reconciled. |
 | Discord guild wallets | Not enabled in the MVP. Guild channels return a limitation message instead of using a user wallet implicitly. |
 | Docker scaffold | Helpful for staging-like demos, not a custody boundary. |
 
@@ -175,10 +229,10 @@ Important limitations:
 
 ## Before hosted production
 
-- Move key management to a managed KMS or HSM-backed service.
+- Move key management to a remote signer or managed KMS/HSM-backed service.
 - Replace SQLite with a production database and implement a distributed lock with TTL, ownership token, and safe release.
 - Use webhook mode with HTTPS and `WEBHOOK_SECRET_TOKEN`.
 - Add structured audit log shipping and alerting for repeated payment failures.
-- Add sandboxing around the AgentCash CLI process (e.g., seccomp, network restrictions).
-- Implement key rotation procedures for bot token, API keys, and master encryption key.
+- Add sandboxing around any remaining AgentCash CLI process (e.g., seccomp, network restrictions).
+- Implement key rotation procedures for wallet keys, bot token, API keys, and master encryption key.
 - Review custody model — this MVP assumes the operator can access all wallet keys.

@@ -24,6 +24,11 @@ export interface TelegramGroupContext {
   creatorProfile?: TelegramProfile;
 }
 
+export interface DiscordGuildContext {
+  guildId: string;
+  createdByDiscordId: string;
+}
+
 export class WalletManager {
   constructor(
     private readonly db: AppDatabase,
@@ -53,7 +58,12 @@ export class WalletManager {
       let wallet = this.db.getWalletByUserId(user.id);
 
       if (!wallet) {
-        wallet = this.db.createUserWallet(user.id, { homeDirHash, status: "pending" });
+        wallet = this.db.createUserWallet(user.id, {
+          homeDirHash,
+          walletRef: homeDirHash,
+          signerBackend: this.custodyMode(),
+          status: "pending"
+        });
       }
 
       if (!wallet.home_dir_hash) {
@@ -61,7 +71,7 @@ export class WalletManager {
       }
 
       if (
-        wallet.status === "active" &&
+        (wallet.status === "active" || wallet.status === "disabled") &&
         wallet.address &&
         wallet.encrypted_private_key &&
         wallet.home_dir_hash
@@ -82,11 +92,21 @@ export class WalletManager {
 
       wallet = this.db.updateWallet(wallet.id, {
         homeDirHash,
+        walletRef: wallet.wallet_ref ?? homeDirHash,
+        signerBackend: wallet.signer_backend ?? this.custodyMode(),
         address: ensuredWallet.address ?? wallet.address,
+        publicAddress: ensuredWallet.address ?? wallet.public_address ?? wallet.address,
         network: ensuredWallet.network ?? wallet.network,
         depositLink: ensuredWallet.depositLink ?? wallet.deposit_link,
         encryptedPrivateKey: ensuredWallet.encryptedPrivateKey ?? wallet.encrypted_private_key,
         status: "active"
+      });
+
+      this.db.recordWalletKeyIfMissing({
+        walletId: wallet.id,
+        encryptedPrivateKey: wallet.encrypted_private_key,
+        signerBackend: wallet.signer_backend,
+        publicAddress: wallet.public_address ?? wallet.address
       });
 
       return { user, wallet };
@@ -119,7 +139,8 @@ export class WalletManager {
             : null,
           createdByUserId: user.id,
           spendCapUsdc: this.config.DEFAULT_SPEND_CAP_USDC,
-          homeDirHash
+          homeDirHash,
+          signerBackend: this.custodyMode()
         });
         group = created.group;
         wallet = created.wallet;
@@ -131,7 +152,7 @@ export class WalletManager {
       }
 
       if (
-        wallet.status === "active" &&
+        (wallet.status === "active" || wallet.status === "disabled") &&
         wallet.address &&
         wallet.encrypted_private_key &&
         wallet.home_dir_hash
@@ -152,15 +173,152 @@ export class WalletManager {
 
       wallet = this.db.updateWallet(wallet.id, {
         homeDirHash,
+        walletRef: wallet.wallet_ref ?? homeDirHash,
+        signerBackend: wallet.signer_backend ?? this.custodyMode(),
         address: ensuredWallet.address ?? wallet.address,
+        publicAddress: ensuredWallet.address ?? wallet.public_address ?? wallet.address,
         network: ensuredWallet.network ?? wallet.network,
         depositLink: ensuredWallet.depositLink ?? wallet.deposit_link,
         encryptedPrivateKey: ensuredWallet.encryptedPrivateKey ?? wallet.encrypted_private_key,
         status: "active"
       });
 
+      this.db.recordWalletKeyIfMissing({
+        walletId: wallet.id,
+        encryptedPrivateKey: wallet.encrypted_private_key,
+        signerBackend: wallet.signer_backend,
+        publicAddress: wallet.public_address ?? wallet.address
+      });
+
       return { user, wallet, group, member };
     });
+  }
+
+  async getOrCreateDiscordGuildWallet(input: DiscordGuildContext): Promise<WalletContextResult> {
+    const guildHash = WalletManager.getHashedDiscordGuildId(input.guildId, this.config.MASTER_ENCRYPTION_KEY);
+    const homeDirHash = WalletManager.getHashedDiscordGuildHomeDirName(input.guildId, this.config.MASTER_ENCRYPTION_KEY);
+
+    return this.lockManager.withLock(`wallet:discord:guild:${guildHash}`, WALLET_LOCK_TTL_MS, async () => {
+      const user = this.db.upsertUser({
+        telegramUserId: `discord:${input.createdByDiscordId}`,
+        defaultSpendCapUsdc: this.config.DEFAULT_SPEND_CAP_USDC
+      });
+
+      let group = this.db.getGroupByDiscordGuildHash(guildHash);
+      let wallet = group ? this.db.getWalletById(group.wallet_id) : undefined;
+      let member = group ? this.db.ensureGroupMember(group.id, user.id, "member") : undefined;
+
+      if (!group || !wallet) {
+        const created = this.db.createGroupWithWallet({
+          telegramChatIdHash: guildHash,
+          platform: "discord",
+          guildIdHash: guildHash,
+          createdByUserId: user.id,
+          spendCapUsdc: this.config.DEFAULT_SPEND_CAP_USDC,
+          homeDirHash,
+          signerBackend: this.custodyMode()
+        });
+        group = created.group;
+        wallet = created.wallet;
+        member = created.member;
+      }
+
+      if (!wallet.home_dir_hash) {
+        wallet = this.db.updateWallet(wallet.id, { homeDirHash });
+      }
+
+      if (
+        (wallet.status === "active" || wallet.status === "disabled") &&
+        wallet.address &&
+        wallet.encrypted_private_key &&
+        wallet.home_dir_hash
+      ) {
+        return { user, wallet, group, member };
+      }
+
+      const ensuredWallet = await this.agentcashClient.ensureWallet(wallet);
+      wallet = this.db.updateWallet(wallet.id, {
+        homeDirHash,
+        walletRef: wallet.wallet_ref ?? homeDirHash,
+        signerBackend: wallet.signer_backend ?? this.custodyMode(),
+        address: ensuredWallet.address ?? wallet.address,
+        publicAddress: ensuredWallet.address ?? wallet.public_address ?? wallet.address,
+        network: ensuredWallet.network ?? wallet.network,
+        depositLink: ensuredWallet.depositLink ?? wallet.deposit_link,
+        encryptedPrivateKey: ensuredWallet.encryptedPrivateKey ?? wallet.encrypted_private_key,
+        status: "active"
+      });
+
+      this.db.recordWalletKeyIfMissing({
+        walletId: wallet.id,
+        encryptedPrivateKey: wallet.encrypted_private_key,
+        signerBackend: wallet.signer_backend,
+        publicAddress: wallet.public_address ?? wallet.address
+      });
+
+      return { user, wallet, group, member };
+    });
+  }
+
+  async getDiscordGuildWalletForGuild(
+    guildId: string,
+    requesterDiscordId: string
+  ): Promise<WalletContextResult | null> {
+    const guildHash = WalletManager.getHashedDiscordGuildId(guildId, this.config.MASTER_ENCRYPTION_KEY);
+    const group = this.db.getGroupByDiscordGuildHash(guildHash);
+    if (!group) {
+      return null;
+    }
+
+    const user = this.db.upsertUser({
+      telegramUserId: `discord:${requesterDiscordId}`,
+      defaultSpendCapUsdc: this.config.DEFAULT_SPEND_CAP_USDC
+    });
+    const member = this.db.ensureGroupMember(group.id, user.id, "member");
+    const wallet = this.db.getWalletById(group.wallet_id);
+    if (!wallet) {
+      throw new NotFoundError("Discord guild wallet not found.");
+    }
+
+    return { user, wallet, group, member };
+  }
+
+  async getDiscordGuildBalance(
+    guildId: string,
+    requesterDiscordId: string
+  ): Promise<WalletContextResult & { balance: Awaited<ReturnType<AgentCashClient["getBalance"]>> }> {
+    const context = await this.getDiscordGuildWalletForGuild(guildId, requesterDiscordId);
+    if (!context) {
+      throw new NotFoundError("No Discord guild wallet exists yet. Run /ac guild create first.");
+    }
+
+    const balance = await this.agentcashClient.getBalance(context.wallet);
+    const updatedWallet = this.db.updateWallet(context.wallet.id, {
+      address: balance.address ?? context.wallet.address,
+      network: balance.network ?? context.wallet.network,
+      depositLink: balance.depositLink ?? context.wallet.deposit_link
+    });
+
+    return { ...context, wallet: updatedWallet, balance };
+  }
+
+  async getDiscordGuildDepositAddress(
+    guildId: string,
+    requesterDiscordId: string
+  ): Promise<WalletContextResult & { deposit: Awaited<ReturnType<AgentCashClient["getDepositInfo"]>> }> {
+    const context = await this.getDiscordGuildWalletForGuild(guildId, requesterDiscordId);
+    if (!context) {
+      throw new NotFoundError("No Discord guild wallet exists yet. Run /ac guild create first.");
+    }
+
+    const deposit = await this.agentcashClient.getDepositInfo(context.wallet);
+    const updatedWallet = this.db.updateWallet(context.wallet.id, {
+      address: deposit.address ?? context.wallet.address,
+      network: deposit.network ?? context.wallet.network,
+      depositLink: deposit.depositLink ?? context.wallet.deposit_link
+    });
+
+    return { ...context, wallet: updatedWallet, deposit };
   }
 
   async getGroupWalletForTelegramChat(
@@ -281,6 +439,45 @@ export class WalletManager {
     return this.db.updateGroupCap(groupId, input);
   }
 
+  freezeUserWallet(telegramId: string): WalletRow {
+    const user = this.getExistingUser(telegramId);
+    const wallet = this.db.getWalletByUserId(user.id);
+    if (!wallet) {
+      throw new NotFoundError("Wallet has not been created yet");
+    }
+    return this.db.updateWallet(wallet.id, { status: "disabled" });
+  }
+
+  unfreezeUserWallet(telegramId: string): WalletRow {
+    const user = this.getExistingUser(telegramId);
+    const wallet = this.db.getWalletByUserId(user.id);
+    if (!wallet) {
+      throw new NotFoundError("Wallet has not been created yet");
+    }
+    return this.db.updateWallet(wallet.id, { status: "active" });
+  }
+
+  getUserWalletStatus(telegramId: string): WalletRow | undefined {
+    const user = this.db.getUserByTelegramId(telegramId);
+    return user ? this.db.getWalletByUserId(user.id) : undefined;
+  }
+
+  freezeGroupWallet(groupId: string): WalletRow {
+    const wallet = this.db.getWalletByGroupId(groupId);
+    if (!wallet) {
+      throw new NotFoundError("Group wallet has not been created yet");
+    }
+    return this.db.updateWallet(wallet.id, { status: "disabled" });
+  }
+
+  unfreezeGroupWallet(groupId: string): WalletRow {
+    const wallet = this.db.getWalletByGroupId(groupId);
+    if (!wallet) {
+      throw new NotFoundError("Group wallet has not been created yet");
+    }
+    return this.db.updateWallet(wallet.id, { status: "active" });
+  }
+
   isGroupAdmin(groupId: string, userId: string): boolean {
     const member = this.db.getGroupMember(groupId, userId);
     return member?.role === "owner" || member?.role === "admin";
@@ -310,8 +507,20 @@ export class WalletManager {
     return hashSensitiveValue(`group-wallet:${chatId}`, masterKey).slice(0, 24);
   }
 
+  static getHashedDiscordGuildId(guildId: string, masterKey: string): string {
+    return hashSensitiveValue(`discord:guild:${guildId}`, masterKey).slice(0, 24);
+  }
+
+  static getHashedDiscordGuildHomeDirName(guildId: string, masterKey: string): string {
+    return hashSensitiveValue(`discord-guild-wallet:${guildId}`, masterKey).slice(0, 24);
+  }
+
   static maskAddress(address: string | null | undefined): string {
     if (!address) return "not provisioned";
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
+  }
+
+  private custodyMode(): string {
+    return this.config.CUSTODY_MODE ?? "local_cli";
   }
 }

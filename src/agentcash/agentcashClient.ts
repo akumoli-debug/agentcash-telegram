@@ -1,13 +1,11 @@
-import { spawn, execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { promisify } from "node:util";
 import type { AppConfig } from "../config.js";
 import type { WalletRow } from "../db/client.js";
-import { decryptSecret, encryptSecret } from "../lib/crypto.js";
 import { AgentCashError, ConfigError, TimeoutError } from "../lib/errors.js";
-
-const execFileAsync = promisify(execFile);
+import { LocalCliSigner } from "../custody/localCliSigner.js";
+import { createSigner, type Signer } from "../custody/signer.js";
 
 export interface AgentCashBalanceResult {
   address?: string;
@@ -46,63 +44,35 @@ interface WalletCommandInput {
 }
 
 export class AgentCashClient {
-  constructor(private readonly config: AppConfig) {}
+  constructor(
+    private readonly config: AppConfig,
+    private readonly signer: Signer = createSigner(config)
+  ) {}
 
   /**
    * Startup health check — call before accepting requests.
    * Verifies the CLI binary is reachable and the home root is writable.
    * Throws ConfigError with a clear message if any check fails.
    *
-   * NOTE: All CLI interactions are intentionally encapsulated here.
-   * If AgentCash changes its CLI interface, this is the only file to update.
+   * NOTE: CLI execution stays here, but local key decryption lives behind LocalCliSigner.
+   * If AgentCash changes its CLI interface, this file and the local signer boundary are the only places to update.
    */
   async healthCheck(): Promise<void> {
-    try {
-      await execFileAsync(this.config.AGENTCASH_COMMAND, ["--version"], {
-        timeout: 10_000,
-        env: { ...process.env }
-      });
-    } catch {
-      throw new ConfigError(
-        `AgentCash CLI not found or not executable: ${this.config.AGENTCASH_COMMAND}. ` +
-        "Set AGENTCASH_COMMAND and ensure the CLI is installed."
-      );
-    }
-
-    const homeRoot = path.resolve(this.config.AGENTCASH_HOME_ROOT);
-    fs.mkdirSync(homeRoot, { recursive: true });
-
-    const testFile = path.join(homeRoot, ".write-test");
-    try {
-      fs.writeFileSync(testFile, "ok");
-      fs.rmSync(testFile, { force: true });
-    } catch {
-      throw new ConfigError(
-        `AgentCash home root is not writable: ${homeRoot}. ` +
-        "Check AGENTCASH_HOME_ROOT and directory permissions."
-      );
-    }
+    await this.signer.healthCheck();
   }
 
   async ensureWallet(wallet: WalletRow): Promise<AgentCashWalletResult> {
     const homeDir = this.getHomeDir(wallet);
     const raw = await this.runJsonCommand(["accounts"], { wallet, homeDir });
-    const capturedWallet = this.captureWalletFile(homeDir);
-    const encryptedPrivateKey =
-      wallet.encrypted_private_key ??
-      (capturedWallet?.privateKey
-        ? encryptSecret(capturedWallet.privateKey, this.config.MASTER_ENCRYPTION_KEY)
-        : undefined);
+    const capturedWallet = this.requireLocalCliSigner().captureWallet(homeDir, wallet);
 
     const result: AgentCashWalletResult = {
-      address: this.pickAddress(raw) ?? capturedWallet?.address ?? wallet.address ?? undefined,
+      address: this.pickAddress(raw) ?? capturedWallet.address ?? wallet.address ?? undefined,
       network: this.pickNetwork(raw) ?? wallet.network ?? undefined,
       depositLink: this.pickDepositLink(raw) ?? wallet.deposit_link ?? undefined,
-      encryptedPrivateKey,
+      encryptedPrivateKey: capturedWallet.encryptedPrivateKey,
       raw
     };
-
-    this.cleanupWalletArtifacts(homeDir);
 
     if (!result.address) {
       throw new AgentCashError("AgentCash did not return a wallet address");
@@ -303,7 +273,7 @@ export class AgentCashClient {
           reject(
             new AgentCashError("AgentCash command failed", {
               code,
-              stderr: stderr.trim()
+              stderrLength: stderr.trim().length
             })
           );
           return;
@@ -314,8 +284,8 @@ export class AgentCashClient {
         } catch {
           reject(
             new AgentCashError("AgentCash command returned invalid JSON", {
-              stdout: stdout.trim(),
-              stderr: stderr.trim()
+              stdoutLength: stdout.trim().length,
+              stderrLength: stderr.trim().length
             })
           );
         }
@@ -324,20 +294,18 @@ export class AgentCashClient {
   }
 
   private buildCommandEnv(wallet: WalletRow, homeDir: string): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      AGENTCASH_HOME: homeDir,
-      HOME: homeDir
-    };
+    return this.requireLocalCliSigner().buildCommandEnv(wallet, homeDir);
+  }
 
-    if (wallet.encrypted_private_key) {
-      env.X402_PRIVATE_KEY = decryptSecret(
-        wallet.encrypted_private_key,
-        this.config.MASTER_ENCRYPTION_KEY
-      );
+  private requireLocalCliSigner(): LocalCliSigner {
+    if (this.signer instanceof LocalCliSigner) {
+      return this.signer;
     }
 
-    return env;
+    throw new ConfigError(
+      `AgentCash CLI command execution requires CUSTODY_MODE=local_cli. ` +
+      `Current mode is ${this.config.CUSTODY_MODE}; remote_signer/kms need a non-CLI payment executor.`
+    );
   }
 
   private parseJson(stdout: string): Record<string, unknown> {
@@ -361,43 +329,6 @@ export class AgentCashClient {
     }
 
     throw new Error("No JSON object found");
-  }
-
-  private captureWalletFile(homeDir: string): { privateKey: string; address?: string } | null {
-    for (const candidate of this.walletFileCandidates(homeDir)) {
-      if (!fs.existsSync(candidate)) {
-        continue;
-      }
-
-      const parsed = JSON.parse(fs.readFileSync(candidate, "utf8")) as {
-        privateKey?: string;
-        address?: string;
-      };
-
-      if (typeof parsed.privateKey === "string") {
-        return {
-          privateKey: parsed.privateKey,
-          address: typeof parsed.address === "string" ? parsed.address : undefined
-        };
-      }
-    }
-
-    return null;
-  }
-
-  private cleanupWalletArtifacts(homeDir: string) {
-    for (const candidate of this.walletFileCandidates(homeDir)) {
-      if (fs.existsSync(candidate)) {
-        fs.rmSync(candidate, { force: true });
-      }
-    }
-  }
-
-  private walletFileCandidates(homeDir: string): string[] {
-    return [
-      path.join(homeDir, "wallet.json"),
-      path.join(homeDir, ".agentcash", "wallet.json")
-    ];
   }
 
   private pickAddress(raw: unknown): string | undefined {

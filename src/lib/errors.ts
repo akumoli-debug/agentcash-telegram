@@ -68,6 +68,13 @@ export class RateLimitError extends AppError {
   }
 }
 
+export class LockUnavailableError extends AppError {
+  constructor(message = "Another request is already in progress. Please retry in a moment.", details?: unknown) {
+    super("LOCK_UNAVAILABLE", message, { status: 409, details });
+    this.name = "LockUnavailableError";
+  }
+}
+
 export class QuoteError extends AppError {
   constructor(message: string, details?: unknown) {
     super("QUOTE_ERROR", message, { status: 402, details });

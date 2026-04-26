@@ -149,7 +149,8 @@ describe("inline mode", () => {
       skill: "generate",
       sanitizedInput: "neon wallet icon"
     });
-    const tampered = `${token.slice(0, -1)}0`;
+    const replacement = token.endsWith("0") ? "1" : "0";
+    const tampered = `${token.slice(0, -1)}${replacement}`;
 
     expect(() => consumeSignedInlinePayload(db, config.MASTER_ENCRYPTION_KEY, tampered)).toThrow();
   });

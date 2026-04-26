@@ -5,6 +5,7 @@ import type { AppConfig } from "../src/config.js";
 import { runBalanceCommand, runSkillCommand } from "../src/core/commandHandlers.js";
 import type { CommandContext } from "../src/core/commandContext.js";
 import { AppDatabase } from "../src/db/client.js";
+import { buildDiscordCommandPayload, handleSlashCommand } from "../src/discordBot.js";
 import { QuoteError } from "../src/lib/errors.js";
 import type { AppLogger } from "../src/lib/logger.js";
 import { WalletManager } from "../src/wallets/walletManager.js";
@@ -197,4 +198,200 @@ describe("transport-neutral command layer", () => {
 
     expect(ac.fetchJson).toHaveBeenCalledTimes(1);
   });
+
+  it("Discord command registration includes wallet and guild subcommands", () => {
+    const payload = buildDiscordCommandPayload() as Array<{ options: Array<{ name: string; options: Array<{ name: string }> }> }>;
+    const ac = payload[0]!;
+    const groups = new Map(ac.options.map(group => [group.name, group.options.map(option => option.name)]));
+
+    expect(groups.get("wallet")).toEqual(expect.arrayContaining(["balance", "deposit", "cap", "history", "research"]));
+    expect(groups.get("guild")).toEqual(expect.arrayContaining(["create", "balance", "deposit", "cap", "history", "sync-admins", "research"]));
+  });
+
+  it("Discord guild default paid call does not silently use a user wallet", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const config = makeConfig();
+    const ac = makeAgentCashClient();
+    const walletManager = new WalletManager(db, config, ac);
+    const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
+    const interaction = makeDiscordInteraction({
+      group: null,
+      subcommand: "research",
+      query: "x402 adoption",
+      guildId: "guild-1"
+    });
+
+    await handleSlashCommand(interaction as never, { config, db, walletManager, skillExecutor, logger: silentLogger });
+
+    expect(interaction.replies[0]?.content).toContain("Use /ac wallet research");
+    expect(db.sqlite.prepare("SELECT * FROM wallets").all()).toHaveLength(0);
+  });
+
+  it("Discord guild create requires Manage Server or Administrator", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const config = makeConfig();
+    const ac = makeAgentCashClient();
+    const walletManager = new WalletManager(db, config, ac);
+    const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
+    const interaction = makeDiscordInteraction({
+      group: "guild",
+      subcommand: "create",
+      guildId: "guild-1",
+      permissions: "0"
+    });
+
+    await expect(
+      handleSlashCommand(interaction as never, { config, db, walletManager, skillExecutor, logger: silentLogger })
+    ).rejects.toThrow(/Manage Server/);
+  });
+
+  it("Discord guild cap requires Manage Server or Administrator", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const config = makeConfig();
+    const ac = makeAgentCashClient();
+    const walletManager = new WalletManager(db, config, ac);
+    await walletManager.getOrCreateDiscordGuildWallet({ guildId: "guild-1", createdByDiscordId: "99999" });
+    const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
+    const interaction = makeDiscordInteraction({
+      group: "guild",
+      subcommand: "cap",
+      guildId: "guild-1",
+      amount: "1",
+      permissions: "0"
+    });
+
+    await expect(
+      handleSlashCommand(interaction as never, { config, db, walletManager, skillExecutor, logger: silentLogger })
+    ).rejects.toThrow(/Manage Server/);
+  });
+
+  it("Discord guild wallet paid call uses the guild wallet", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const config = makeConfig({ DEFAULT_SPEND_CAP_USDC: 5 });
+    const ac = makeAgentCashClient({ checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 1, raw: {} }) });
+    const walletManager = new WalletManager(db, config, ac);
+    const groupContext = await walletManager.getOrCreateDiscordGuildWallet({
+      guildId: "guild-1",
+      createdByDiscordId: "99999"
+    });
+    const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
+    const guildCtx = makeContext("discord", {
+      walletScope: {
+        kind: "guild",
+        walletOwnerId: "discord:99999",
+        chatId: "guild-1",
+        chatType: "discord_guild",
+        guildId: "guild-1",
+        channelId: "channel-1"
+      }
+    });
+
+    const result = await runSkillCommand(guildCtx, { config, db, walletManager, skillExecutor }, "research", "x402 adoption");
+    void result;
+
+    const transaction = db.sqlite.prepare("SELECT * FROM transactions").get() as { wallet_id: string; group_id: string };
+    expect(transaction.wallet_id).toBe(groupContext.wallet.id);
+    expect(transaction.group_id).toBe(groupContext.group!.id);
+  });
+
+  it("wrong Discord user cannot confirm a user-wallet quote", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const config = makeConfig();
+    const ac = makeAgentCashClient();
+    const walletManager = new WalletManager(db, config, ac);
+    const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
+    const discordCtx = makeContext("discord");
+
+    await runSkillCommand(discordCtx, { config, db, walletManager, skillExecutor }, "research", "x402 adoption");
+
+    await expect(
+      skillExecutor.executeApprovedQuote(discordCtx.confirmations[0]!, {
+        telegramId: "discord:11111",
+        telegramChatId: "discord:dm:99999",
+        telegramChatType: "private"
+      })
+    ).rejects.toThrow(QuoteError);
+  });
+
+  it("Discord guild admin can approve a guild quote when policy requires admin", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const config = makeConfig();
+    const ac = makeAgentCashClient();
+    const walletManager = new WalletManager(db, config, ac);
+    const groupContext = await walletManager.getOrCreateDiscordGuildWallet({
+      guildId: "guild-1",
+      createdByDiscordId: "99999"
+    });
+    const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
+    const guildCtx = makeContext("discord", {
+      walletScope: {
+        kind: "guild",
+        walletOwnerId: "discord:11111",
+        chatId: "guild-1",
+        chatType: "discord_guild",
+        guildId: "guild-1",
+        channelId: "channel-1"
+      }
+    });
+
+    await runSkillCommand(guildCtx, { config, db, walletManager, skillExecutor }, "research", "x402 adoption");
+    const admin = db.getUserByTelegramId("discord:99999")!;
+    db.recordTelegramAdminVerification({
+      groupId: groupContext.group!.id,
+      userId: admin.id,
+      telegramStatus: "administrator",
+      source: "discord_permissions"
+    });
+
+    await expect(
+      skillExecutor.executeApprovedQuote(guildCtx.confirmations[0]!, {
+        telegramId: "discord:99999",
+        telegramChatId: "guild-1",
+        telegramChatType: "discord_guild"
+      })
+    ).resolves.toMatchObject({ type: "completed" });
+  });
 });
+
+function makeDiscordInteraction(input: {
+  group: string | null;
+  subcommand: string;
+  query?: string;
+  amount?: string;
+  guildId?: string | null;
+  permissions?: string;
+}) {
+  const replies: Array<{ content: string; ephemeral?: boolean }> = [];
+  return {
+    id: "interaction-1",
+    commandName: "ac",
+    user: { id: "99999" },
+    guildId: input.guildId ?? null,
+    channelId: "channel-1",
+    member: input.guildId
+      ? { permissions: input.permissions ?? String(1n << 5n) }
+      : null,
+    replies,
+    options: {
+      getSubcommandGroup: () => input.group,
+      getSubcommand: () => input.subcommand,
+      getString: (name: string) => (name === "query" ? input.query : input.amount) ?? null,
+      getBoolean: () => false
+    },
+    isRepliable: () => true,
+    replied: false,
+    deferred: false,
+    reply: vi.fn(async (message: { content: string; ephemeral?: boolean } | string) => {
+      replies.push(typeof message === "string" ? { content: message } : message);
+    }),
+    followUp: vi.fn(async (message: { content: string; ephemeral?: boolean } | string) => {
+      replies.push(typeof message === "string" ? { content: message } : message);
+    })
+  };
+}

@@ -192,6 +192,8 @@ export class SkillExecutor {
     return this.lockManager.withLock(`actor:${userHash}`, EXECUTION_LOCK_TTL_MS, async () => {
       const walletContext = await this._getWallet(context, userHash, skill.name);
       const { user, wallet, group } = walletContext;
+      this.assertWalletCanSpend(wallet);
+      this.assertRateLimit(user.id, "quote_preflight", this.config.RATE_LIMIT_QUOTE_MAX_PER_MINUTE);
 
       const balance = await this._getBalance(wallet, userHash, skill.name);
 
@@ -202,6 +204,7 @@ export class SkillExecutor {
         userHash,
         requestHash
       );
+      this.assertGroupDailyCap(group, quotedCostCents, userHash, wallet.id, skill.name, requestHash);
 
       const hardCapCents = Math.round(this.config.HARD_SPEND_CAP_USDC * 100);
 
@@ -268,7 +271,10 @@ export class SkillExecutor {
         expiresAt,
         requesterUserId: user.id,
         groupId: group?.id ?? null,
-        requiresGroupAdminApproval
+        requiresGroupAdminApproval,
+        platform: context.telegramId.startsWith("discord:") ? "discord" : "telegram",
+        actorIdHash: userHash,
+        walletScope: group ? (group.platform === "discord" ? "discord_guild" : "telegram_group") : "user"
       });
 
       const needsConfirmation =
@@ -342,10 +348,10 @@ export class SkillExecutor {
 
       const group = quote.group_id ? this.db.getGroupById(quote.group_id) : undefined;
       const confirmerUser = this.db.getUserByTelegramId(context.telegramId);
-      const chatHash = WalletManager.getHashedChatId(
-        context.telegramChatId,
-        this.config.MASTER_ENCRYPTION_KEY
-      );
+      const chatHash =
+        group?.platform === "discord"
+          ? WalletManager.getHashedDiscordGuildId(context.telegramChatId, this.config.MASTER_ENCRYPTION_KEY)
+          : WalletManager.getHashedChatId(context.telegramChatId, this.config.MASTER_ENCRYPTION_KEY);
 
       if (quote.group_id && !group) {
         throw new QuoteError("This group confirmation is no longer valid.");
@@ -390,6 +396,23 @@ export class SkillExecutor {
             safeErrorMessage: "Non-admin attempted to approve over-cap group quote"
           });
           throw new QuoteError("Only a group wallet owner or admin can confirm this over-cap request.");
+        }
+
+        if (
+          quote.requires_group_admin_approval &&
+          !this.db.hasFreshTelegramAdminVerification(group.id, confirmerUser!.id)
+        ) {
+          this.db.logPreflightAttempt({
+            userHash,
+            walletId: quote.wallet_id,
+            skill: quote.skill,
+            failureStage: "replay",
+            errorCode: "TELEGRAM_ADMIN_VERIFICATION_STALE",
+            safeErrorMessage: "Over-cap group quote approval lacked fresh Telegram admin verification"
+          });
+          throw new QuoteError(
+            "Telegram admin verification is required before approving this over-cap group request."
+          );
         }
 
         if (!quote.requires_group_admin_approval && !isRequester && !isAdmin) {
@@ -463,6 +486,22 @@ export class SkillExecutor {
   ): Promise<{ user: UserRow; wallet: WalletRow; group?: GroupRow }> {
     try {
       if (context.telegramChatType && context.telegramChatType !== "private") {
+        if (context.telegramChatType === "discord_guild") {
+          const discordUserId = context.telegramId.replace(/^discord:/, "");
+          const groupContext = await this.walletManager.getDiscordGuildWalletForGuild(
+            context.telegramChatId,
+            discordUserId
+          );
+
+          if (!groupContext) {
+            throw new ValidationError(
+              "This Discord server does not have a guild wallet yet. Ask a server manager to run /ac guild create first."
+            );
+          }
+
+          return groupContext;
+        }
+
         const groupContext = await this.walletManager.getGroupWalletForTelegramChat(
           context.telegramChatId,
           context.telegramId
@@ -559,9 +598,29 @@ export class SkillExecutor {
   ): Promise<{ type: "completed" } & SkillRenderResult> {
     const quote = this.db.getQuote(quoteId)!;
     const requesterUserId = quote.requester_user_id ?? wallet.owner_user_id;
+    this.assertWalletCanSpend(wallet);
 
     if (!requesterUserId) {
       throw new AgentCashError("Requester not found for this confirmation.");
+    }
+    this.assertRateLimit(
+      requesterUserId,
+      "paid_execution",
+      this.config.RATE_LIMIT_PAID_EXECUTION_MAX_PER_MINUTE
+    );
+
+    if (!this.db.atomicBeginQuoteExecution(quoteId)) {
+      this.db.logPreflightAttempt({
+        userHash,
+        walletId: wallet.id,
+        skill: skill.name,
+        endpoint: skill.endpoint,
+        requestHash: quote.request_hash,
+        failureStage: "replay",
+        errorCode: "QUOTE_EXECUTION_ALREADY_STARTED",
+        safeErrorMessage: "Quote execution was already started by another worker"
+      });
+      throw new QuoteError("This confirmation was already used.");
     }
 
     const transaction = this.db.createTransaction({
@@ -574,6 +633,7 @@ export class SkillExecutor {
       skill: skill.name,
       endpoint: skill.endpoint,
       quoteId,
+      idempotencyKey: `quote:${quoteId}:execute`,
       status: "submitted",
       estimatedCostCents: quote.quoted_cost_cents,
       quotedPriceUsdc: Number((quote.quoted_cost_cents / 100).toFixed(6)),
@@ -598,7 +658,7 @@ export class SkillExecutor {
         txHash: fetchResult.txHash ?? null
       });
 
-      this.db.updateQuoteStatus(quoteId, "executed", {
+      this.db.transitionQuoteStatus(quoteId, "executing", "succeeded", {
         executedAt: new Date().toISOString(),
         transactionId: transaction.id
       });
@@ -641,7 +701,7 @@ export class SkillExecutor {
         errorMessage: error instanceof Error ? error.message : "Unknown error"
       });
 
-      this.db.updateQuoteStatus(quoteId, "failed");
+      this.db.transitionQuoteStatus(quoteId, "executing", "failed");
 
       this.logger.warn(
         {
@@ -675,6 +735,58 @@ export class SkillExecutor {
         ? error
         : new AgentCashError("Skill execution failed", { cause: String(error) });
     }
+  }
+
+  private assertWalletCanSpend(wallet: WalletRow): void {
+    if (wallet.status === "disabled") {
+      throw new ValidationError("This wallet is frozen. Balance, deposit, and history still work.");
+    }
+  }
+
+  private assertRateLimit(userId: string, eventName: string, maxPerMinute: number): void {
+    const minuteLimit = maxPerMinute ?? 8;
+    const result = this.db.checkAndRecordRateLimit(userId, {
+      eventName,
+      maxPerMinute: minuteLimit,
+      maxPerHour: Math.max(minuteLimit, minuteLimit * 12)
+    });
+
+    if (!result.allowed) {
+      throw new ValidationError("Rate limit reached. Please retry later.");
+    }
+  }
+
+  private assertGroupDailyCap(
+    group: GroupRow | undefined,
+    quotedCostCents: number,
+    userHash: string,
+    walletId: string,
+    skillName: string,
+    requestHash: string
+  ): void {
+    if (!group) {
+      return;
+    }
+
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const spent = this.db.getDailySpendCentsForGroup(group.id, since);
+    const limit = Math.round((this.config.GROUP_DAILY_CAP_USDC ?? 25) * 100);
+
+    if (spent + quotedCostCents <= limit) {
+      return;
+    }
+
+    this.db.logPreflightAttempt({
+      userHash,
+      walletId,
+      skill: skillName,
+      requestHash,
+      failureStage: "cap",
+      errorCode: "GROUP_DAILY_CAP_EXCEEDED",
+      safeErrorMessage: "Group daily cap exceeded"
+    });
+
+    throw new SpendingCapError("This group wallet has reached its daily spend cap.");
   }
 }
 

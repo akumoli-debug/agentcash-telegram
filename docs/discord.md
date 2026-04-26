@@ -1,78 +1,98 @@
-# Discord MVP
+# Discord
 
-**Roadmap / experimental. Not part of the shipped Telegram private-chat MVP demo.**
+Discord is now split into two explicit wallet surfaces:
 
-The Discord port is a thin adapter over the shared command layer. It does not copy Telegram command business logic.
+- **DM/user wallets**: stable experimental surface for a single Discord user.
+- **Guild wallets**: experimental server wallet surface, gated by Discord `Manage Server` or `Administrator`.
 
-## Architecture
+This is still not a production custody claim. Discord uses the same local SQLite, local locks, AgentCash CLI subprocess, and local key custody caveats as Telegram.
 
-Discord interactions are converted into the transport-neutral `CommandContext` interface:
-
-- `platform: "discord"`
-- hashed actor/guild/channel identifiers for logs and command history
-- `reply()` for normal output
-- `replyPrivateOrEphemeral()` for wallet-sensitive output
-- `confirm()` for quote confirmation buttons
-- `walletScope` describing whether the interaction is a direct-message user wallet or a guild scope
-
-The shared command layer then calls the same `WalletManager` and `SkillExecutor` used by Telegram. Quote creation, spending caps, immutable canonical requests, atomic approval, and replay protection are unchanged.
-
-## Current Scope
-
-Supported slash commands:
-
-```text
-/ac balance
-/ac deposit
-/ac research query:<query>
-```
-
-Direct messages use user wallets.
-
-Guild/server channels currently return an honest limitation message for paid wallet commands: Discord guild wallets are not enabled until there is an explicit guild wallet creation flow. This avoids silently charging a user wallet from a server channel.
-
-## Discord Setup
+## Setup
 
 1. Create an app in the Discord Developer Portal.
-2. Add a bot user and copy its token.
-3. Copy the application ID from General Information.
-4. Enable the bot scopes needed for installation:
+2. Add a bot user and copy the bot token.
+3. Copy the application ID.
+4. Install the app with:
 
 ```text
 bot
 applications.commands
 ```
 
-5. Set environment variables:
+5. Configure:
 
 ```bash
 DISCORD_BOT_TOKEN=replace-me
 DISCORD_APPLICATION_ID=replace-me
+DISCORD_DEV_GUILD_ID=optional-dev-server-id
 ```
 
-6. Start the app:
+If `DISCORD_DEV_GUILD_ID` is set, commands register to that guild for fast development updates. Without it, commands register globally for production and Discord propagation can take minutes.
 
-```bash
-corepack pnpm dev
-```
+## Command List
 
-On startup, the app registers the global `/ac` slash command set. Global command propagation can take a few minutes in Discord.
-
-## Local Demo
-
-In a direct message with the bot:
+Private user wallet:
 
 ```text
-/ac balance
-/ac deposit
-/ac research query:latest x402 ecosystem activity
+/ac wallet balance
+/ac wallet deposit
+/ac wallet cap amount:<show|off|number>
+/ac wallet history
+/ac wallet research query:<query>
 ```
 
-If the research quote is above the user's cap, the bot replies ephemerally with Confirm and Cancel buttons. Confirm executes the stored quote; replayed button clicks are rejected by the same SQL-level quote transition used by Telegram.
+Experimental guild wallet:
 
-## Safety Notes
+```text
+/ac guild create
+/ac guild balance
+/ac guild deposit public:<true|false>
+/ac guild cap amount:<show|off|number>
+/ac guild history
+/ac guild sync-admins
+/ac guild research query:<query>
+```
 
-- Wallet address, deposit, and balance responses are ephemeral.
-- Discord usernames and message content are not logged by default.
-- Research query text is passed to the paid endpoint only after the normal quote path accepts it.
-- Guild wallet custody is intentionally not implemented in this MVP.
+The top-level `/ac research` path is intentionally not used for guild paid calls. In a server, users must choose `/ac wallet research` for their private wallet or `/ac guild research` for the server wallet.
+
+## Permissions
+
+Guild wallet admin actions require current Discord permissions:
+
+- `Manage Server`, or
+- `Administrator`
+
+This applies to:
+
+- `/ac guild create`
+- `/ac guild cap`
+- `/ac guild sync-admins`
+- approving over-cap guild wallet quotes
+
+Internal `group_members` roles mirror Discord permission state, but they do not replace Discord permission checks. `/ac guild sync-admins` reconciles known Discord managers/admins into internal admin rows and demotes stale internal admins.
+
+## Ephemeral Behavior
+
+- User wallet balance, deposit, cap, history, and confirmations are ephemeral.
+- Guild wallet balance is ephemeral by default.
+- Guild wallet deposit is ephemeral by default.
+- Guild wallet deposit can be posted publicly only with `public:true`.
+- Paid-call confirmations are ephemeral.
+
+## Guild Wallet Semantics
+
+Guild wallets reuse the group wallet storage path with `platform='discord'` and a hashed guild ID. Telegram group wallet logic continues to use `platform='telegram'`.
+
+| Context | Wallet Used |
+| --- | --- |
+| Discord DM `/ac wallet ...` | Discord user wallet |
+| Discord server `/ac wallet ...` | Discord user wallet, shown ephemerally |
+| Discord server `/ac guild ...` | Discord guild wallet |
+| Discord server ambiguous/default paid call | Refused; user must choose wallet or guild |
+
+## Caveats
+
+- Guild admin sync is command-driven, not continuous.
+- Only known users can be promoted into internal admin rows.
+- No quorum policy exists; a verified guild admin can approve an over-cap guild quote.
+- Command contexts/integration metadata is included in the command payload where this Discord.js version allows raw fields, but subcommand-level placement is still enforced by handler checks.

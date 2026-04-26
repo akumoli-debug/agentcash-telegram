@@ -72,10 +72,112 @@ function makeAgentCashClient(overrides: Partial<AgentCashClient> = {}): AgentCas
   } as unknown as AgentCashClient;
 }
 
+function makeGroupCommandContext(input: {
+  fromId: number;
+  text: string;
+  getChatMember?: ReturnType<typeof vi.fn>;
+  getChatAdministrators?: ReturnType<typeof vi.fn>;
+  replies?: string[];
+}) {
+  const replies = input.replies ?? [];
+
+  return {
+    from: { id: input.fromId },
+    chat: { id: -1001, type: "supergroup", title: "Builders" },
+    message: { text: input.text },
+    telegram: {
+      getChatMember: input.getChatMember ?? vi.fn().mockResolvedValue({ status: "administrator" }),
+      getChatAdministrators: input.getChatAdministrators ?? vi.fn().mockResolvedValue([])
+    },
+    reply: vi.fn(async (text: string) => {
+      replies.push(text);
+    })
+  } as never;
+}
+
 describe("group wallets", () => {
   let db: AppDatabase;
 
   afterEach(() => db?.close());
+
+  it("does not allow a Telegram non-admin to create a group wallet", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const ac = makeAgentCashClient();
+    const config = makeConfig();
+    const wm = new WalletManager(db, config, ac);
+    const replies: string[] = [];
+    const handler = createGroupWalletCommand({ config, db, walletManager: wm });
+
+    await handler(
+      makeGroupCommandContext({
+        fromId: 99999,
+        text: "/groupwallet create",
+        getChatMember: vi.fn().mockResolvedValue({ status: "member" }),
+        replies
+      })
+    );
+
+    expect(replies[0]).toContain("Only Telegram group creators or administrators");
+    expect(db.sqlite.prepare("SELECT * FROM groups").all()).toHaveLength(0);
+  });
+
+  it("allows a Telegram admin to create a group wallet", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const ac = makeAgentCashClient();
+    const config = makeConfig();
+    const wm = new WalletManager(db, config, ac);
+    const replies: string[] = [];
+    const handler = createGroupWalletCommand({ config, db, walletManager: wm });
+
+    await handler(
+      makeGroupCommandContext({
+        fromId: 12345,
+        text: "/groupwallet create",
+        getChatMember: vi.fn().mockResolvedValue({ status: "administrator" }),
+        replies
+      })
+    );
+
+    expect(replies[0]).toContain("Group wallet is ready.");
+    expect(db.sqlite.prepare("SELECT * FROM groups").all()).toHaveLength(1);
+    expect(db.sqlite.prepare("SELECT * FROM telegram_admin_verifications").all()).toHaveLength(1);
+  });
+
+  it("does not let a later Telegram member hijack an existing group wallet", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const ac = makeAgentCashClient();
+    const config = makeConfig();
+    const wm = new WalletManager(db, config, ac);
+    const handler = createGroupWalletCommand({ config, db, walletManager: wm });
+    const createReplies: string[] = [];
+    const memberReplies: string[] = [];
+
+    await handler(
+      makeGroupCommandContext({
+        fromId: 12345,
+        text: "/groupwallet create",
+        getChatMember: vi.fn().mockResolvedValue({ status: "creator" }),
+        replies: createReplies
+      })
+    );
+    const group = db.sqlite.prepare("SELECT * FROM groups").get() as { created_by_user_id: string };
+
+    await handler(
+      makeGroupCommandContext({
+        fromId: 99999,
+        text: "/groupwallet create",
+        getChatMember: vi.fn().mockResolvedValue({ status: "member" }),
+        replies: memberReplies
+      })
+    );
+
+    expect(memberReplies[0]).toContain("Only Telegram group creators or administrators");
+    expect((db.sqlite.prepare("SELECT * FROM groups").get() as { created_by_user_id: string }).created_by_user_id)
+      .toBe(group.created_by_user_id);
+  });
 
   it("creates group wallets idempotently", async () => {
     db = new AppDatabase(":memory:");
@@ -166,6 +268,124 @@ describe("group wallets", () => {
     expect(db.getGroupByTelegramChatHash(WalletManager.getHashedChatId("-1001", MASTER_KEY))!.spend_cap_usdc).toBe(0.5);
   });
 
+  it("requires fresh Telegram admin verification to change the group cap", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const ac = makeAgentCashClient();
+    const config = makeConfig();
+    const wm = new WalletManager(db, config, ac);
+    await wm.getOrCreateGroupWallet({
+      chatId: "-1001",
+      title: "Builders",
+      createdByTelegramId: "12345"
+    });
+    const replies: string[] = [];
+    const handler = createGroupWalletCommand({ config, db, walletManager: wm });
+
+    await handler(
+      makeGroupCommandContext({
+        fromId: 12345,
+        text: "/groupwallet cap 1",
+        getChatMember: vi.fn().mockResolvedValue({ status: "administrator" }),
+        replies
+      })
+    );
+
+    const group = db.getGroupByTelegramChatHash(WalletManager.getHashedChatId("-1001", MASTER_KEY))!;
+    const owner = db.getUserByTelegramId("12345")!;
+    expect(group.spend_cap_usdc).toBe(1);
+    expect(db.hasFreshTelegramAdminVerification(group.id, owner.id)).toBe(true);
+  });
+
+  it("does not let stale internal admins without Telegram admin status change the cap", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const ac = makeAgentCashClient();
+    const config = makeConfig();
+    const wm = new WalletManager(db, config, ac);
+    await wm.getOrCreateGroupWallet({
+      chatId: "-1001",
+      title: "Builders",
+      createdByTelegramId: "12345"
+    });
+    const replies: string[] = [];
+    const handler = createGroupWalletCommand({ config, db, walletManager: wm });
+
+    await handler(
+      makeGroupCommandContext({
+        fromId: 12345,
+        text: "/groupwallet cap 1",
+        getChatMember: vi.fn().mockResolvedValue({ status: "member" }),
+        replies
+      })
+    );
+
+    const group = db.getGroupByTelegramChatHash(WalletManager.getHashedChatId("-1001", MASTER_KEY))!;
+    expect(replies[0]).toContain("Only Telegram group creators or administrators");
+    expect(group.spend_cap_usdc).toBe(0.5);
+  });
+
+  it("sync-admins promotes Telegram admins and demotes stale internal admins", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const ac = makeAgentCashClient();
+    const config = makeConfig();
+    const wm = new WalletManager(db, config, ac);
+    const groupContext = await wm.getOrCreateGroupWallet({
+      chatId: "-1001",
+      title: "Builders",
+      createdByTelegramId: "12345"
+    });
+    const knownAdmin = db.upsertUser({ telegramUserId: "22222", defaultSpendCapUsdc: 0.5 });
+    const staleAdmin = db.upsertUser({ telegramUserId: "33333", defaultSpendCapUsdc: 0.5 });
+    db.ensureGroupMember(groupContext.group!.id, knownAdmin.id, "member");
+    db.ensureGroupMember(groupContext.group!.id, staleAdmin.id, "admin");
+    const replies: string[] = [];
+    const handler = createGroupWalletCommand({ config, db, walletManager: wm });
+
+    await handler(
+      makeGroupCommandContext({
+        fromId: 12345,
+        text: "/groupwallet sync-admins",
+        getChatMember: vi.fn().mockResolvedValue({ status: "administrator" }),
+        getChatAdministrators: vi.fn().mockResolvedValue([
+          { user: { id: 12345 }, status: "creator" },
+          { user: { id: 22222 }, status: "administrator" },
+          { user: { id: 44444 }, status: "administrator" }
+        ]),
+        replies
+      })
+    );
+
+    expect(replies[0]).toContain("Known Telegram admins promoted: 1");
+    expect(replies[0]).toContain("Internal admins demoted: 1");
+    expect(replies[0]).toContain("Telegram admins not known to the bot: 1");
+    expect(db.getGroupMember(groupContext.group!.id, knownAdmin.id)?.role).toBe("admin");
+    expect(db.getGroupMember(groupContext.group!.id, staleAdmin.id)?.role).toBe("member");
+  });
+
+  it("fails closed when the bot cannot verify Telegram admin status", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const ac = makeAgentCashClient();
+    const config = makeConfig();
+    const wm = new WalletManager(db, config, ac);
+    const replies: string[] = [];
+    const handler = createGroupWalletCommand({ config, db, walletManager: wm });
+
+    await handler(
+      makeGroupCommandContext({
+        fromId: 12345,
+        text: "/groupwallet create",
+        getChatMember: vi.fn().mockRejectedValue(new Error("CHAT_ADMIN_REQUIRED")),
+        replies
+      })
+    );
+
+    expect(replies[0]).toContain("I could not verify Telegram admin status");
+    expect(db.sqlite.prepare("SELECT * FROM groups").all()).toHaveLength(0);
+  });
+
   it("does not let a member approve someone else's over-cap group quote", async () => {
     db = new AppDatabase(":memory:");
     db.initialize();
@@ -198,5 +418,52 @@ describe("group wallets", () => {
     ).rejects.toThrow(QuoteError);
 
     expect(ac.fetchJson).not.toHaveBeenCalled();
+  });
+
+  it("requires fresh Telegram admin verification for over-cap group approval", async () => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    const config = makeConfig();
+    const ac = makeAgentCashClient({
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} })
+    });
+    const wm = new WalletManager(db, config, ac);
+    const groupContext = await wm.getOrCreateGroupWallet({
+      chatId: "-1001",
+      title: "Builders",
+      createdByTelegramId: "12345"
+    });
+    const executor = new SkillExecutor(db, wm, ac, silentLogger, config);
+
+    const result = await executor.execute("research", "x402 protocol", {
+      telegramId: "99999",
+      telegramChatId: "-1001",
+      telegramChatType: "supergroup"
+    });
+
+    if (result.type !== "confirmation_required") throw new Error("expected confirmation");
+
+    await expect(
+      executor.executeApprovedQuote(result.quoteId, {
+        telegramId: "12345",
+        telegramChatId: "-1001",
+        telegramChatType: "supergroup"
+      })
+    ).rejects.toThrow(QuoteError);
+
+    db.recordTelegramAdminVerification({
+      groupId: groupContext.group!.id,
+      userId: groupContext.user.id,
+      telegramStatus: "administrator",
+      source: "test"
+    });
+
+    await expect(
+      executor.executeApprovedQuote(result.quoteId, {
+        telegramId: "12345",
+        telegramChatId: "-1001",
+        telegramChatType: "supergroup"
+      })
+    ).resolves.toMatchObject({ type: "completed" });
   });
 });

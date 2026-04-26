@@ -1,0 +1,22 @@
+flowchart LR
+  dm["Discord DM"]
+  guild["Discord guild channel"]
+  ac["/ac command"]
+  wallet["/ac wallet ...\nuser wallet"]
+  gwallet["/ac guild ...\nguild wallet"]
+  perms["Manage Server or Administrator"]
+  dbrole["Internal role mirror"]
+  quote["Quote flow"]
+  eph["Ephemeral response"]
+
+  dm --> ac
+  guild --> ac
+  ac --> wallet
+  ac --> gwallet
+  wallet --> quote
+  wallet --> eph
+  gwallet --> perms
+  perms --> dbrole
+  dbrole --> quote
+  gwallet --> eph
+  gwallet -. "deposit may be public only with public=true" .-> guild

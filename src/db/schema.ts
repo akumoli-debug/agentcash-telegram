@@ -3,6 +3,8 @@ export const schemaStatements = [
     CREATE TABLE IF NOT EXISTS groups (
       id TEXT PRIMARY KEY,
       telegram_chat_id_hash TEXT NOT NULL UNIQUE,
+      platform TEXT NOT NULL DEFAULT 'telegram',
+      guild_id_hash TEXT,
       title_hash TEXT,
       wallet_id TEXT NOT NULL UNIQUE,
       created_by_user_id TEXT NOT NULL,
@@ -29,6 +31,23 @@ export const schemaStatements = [
   `
     CREATE INDEX IF NOT EXISTS group_members_group_role_idx
     ON group_members(group_id, role)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS telegram_admin_verifications (
+      id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      verified_at TEXT NOT NULL,
+      telegram_status TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      source TEXT NOT NULL,
+      FOREIGN KEY (group_id) REFERENCES groups(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS telegram_admin_verifications_group_user_expires_idx
+    ON telegram_admin_verifications(group_id, user_id, expires_at DESC)
   `,
   `
     CREATE TABLE IF NOT EXISTS users (
@@ -61,6 +80,10 @@ export const schemaStatements = [
       address TEXT,
       network TEXT,
       deposit_link TEXT,
+      wallet_ref TEXT,
+      signer_backend TEXT NOT NULL DEFAULT 'local_cli',
+      public_address TEXT,
+      active_key_version INTEGER,
       encrypted_private_key TEXT,
       status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'active', 'disabled')),
       created_at TEXT NOT NULL,
@@ -83,6 +106,39 @@ export const schemaStatements = [
     WHERE home_dir_hash IS NOT NULL
   `,
   `
+    CREATE TABLE IF NOT EXISTS key_versions (
+      id TEXT PRIMARY KEY,
+      wallet_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      signer_backend TEXT NOT NULL,
+      public_address TEXT,
+      status TEXT NOT NULL CHECK (status IN ('active', 'deprecated')),
+      created_at TEXT NOT NULL,
+      deprecated_at TEXT,
+      FOREIGN KEY (wallet_id) REFERENCES wallets(id),
+      UNIQUE(wallet_id, version)
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS key_versions_wallet_status_idx
+    ON key_versions(wallet_id, status)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS wallet_keys (
+      id TEXT PRIMARY KEY,
+      wallet_id TEXT NOT NULL,
+      key_version_id TEXT NOT NULL,
+      encrypted_private_key TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (wallet_id) REFERENCES wallets(id),
+      FOREIGN KEY (key_version_id) REFERENCES key_versions(id)
+    )
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS wallet_keys_wallet_idx
+    ON wallet_keys(wallet_id, created_at DESC)
+  `,
+  `
     CREATE TABLE IF NOT EXISTS quotes (
       id TEXT PRIMARY KEY,
       user_hash TEXT NOT NULL,
@@ -94,7 +150,7 @@ export const schemaStatements = [
       quoted_cost_cents INTEGER NOT NULL,
       max_approved_cost_cents INTEGER NOT NULL,
       is_dev_unquoted INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','executed','expired','cancelled','failed')),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','executing','succeeded','expired','canceled','failed')),
       created_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
       approved_at TEXT,
@@ -103,6 +159,9 @@ export const schemaStatements = [
       requester_user_id TEXT,
       group_id TEXT,
       requires_group_admin_approval INTEGER NOT NULL DEFAULT 0,
+      platform TEXT NOT NULL DEFAULT 'telegram',
+      actor_id_hash TEXT,
+      wallet_scope TEXT,
       FOREIGN KEY (wallet_id) REFERENCES wallets(id)
     )
   `,
@@ -135,6 +194,7 @@ export const schemaStatements = [
       estimated_cost_cents INTEGER,
       actual_cost_cents INTEGER,
       tx_hash TEXT,
+      idempotency_key TEXT,
       request_hash TEXT,
       response_hash TEXT,
       request_summary TEXT,
@@ -161,6 +221,11 @@ export const schemaStatements = [
   `
     CREATE INDEX IF NOT EXISTS transactions_group_created_at_idx
     ON transactions(group_id, created_at DESC)
+  `,
+  `
+    CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_key_unique
+    ON transactions(idempotency_key)
+    WHERE idempotency_key IS NOT NULL
   `,
   `
     CREATE TABLE IF NOT EXISTS preflight_attempts (

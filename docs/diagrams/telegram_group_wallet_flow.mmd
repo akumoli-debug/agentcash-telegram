@@ -1,0 +1,33 @@
+sequenceDiagram
+  participant Admin as Telegram admin
+  participant Member as Telegram member
+  participant Bot
+  participant TG as Telegram API
+  participant DB
+  participant Wallets as WalletManager
+
+  Member->>Bot: /groupwallet create
+  Bot->>TG: getChatMember(member)
+  TG-->>Bot: member
+  Bot-->>Member: refused; ask Telegram admin
+
+  Admin->>Bot: /groupwallet create
+  Bot->>TG: getChatMember(admin)
+  TG-->>Bot: administrator or creator
+  Bot->>Wallets: getOrCreateGroupWallet
+  Wallets->>DB: create group wallet + owner
+  Bot->>DB: record admin verification
+  Bot-->>Admin: group wallet ready
+
+  Admin->>Bot: /groupwallet sync-admins
+  Bot->>TG: getChatAdministrators
+  TG-->>Bot: admin list
+  Bot->>DB: promote known admins, demote stale admins
+  Bot-->>Admin: counts only, no names
+
+  Admin->>Bot: /groupwallet cap amount
+  Bot->>DB: check internal owner/admin
+  Bot->>TG: fresh admin verification
+  TG-->>Bot: administrator or creator
+  Bot->>DB: update cap
+  Bot-->>Admin: cap updated

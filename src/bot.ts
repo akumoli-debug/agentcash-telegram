@@ -29,6 +29,7 @@ import {
 import { replyWithError } from "./commands/replyWithError.js";
 import { RouterClient, extractSkillInput } from "./router/routerClient.js";
 import { QuoteError } from "./lib/errors.js";
+import { assertTelegramGroupAdmin } from "./telegram/adminVerifier.js";
 
 export function createBot(deps: {
   config: AppConfig;
@@ -110,6 +111,66 @@ export function createBot(deps: {
   bot.command("enrich", createEnrichCommand(deps));
   bot.command("generate", createGenerateCommand(deps));
   bot.command("history", createHistoryCommand(deps));
+  bot.command("freeze", async ctx => {
+    if (!ctx.from || !ctx.chat) return;
+    try {
+      if (ctx.chat.type === "private") {
+        deps.walletManager.freezeUserWallet(String(ctx.from.id));
+        await ctx.reply("Your wallet is frozen. Balance, deposit, and history still work.");
+        return;
+      }
+
+      const chatHash = hashSensitiveValue(`chat:${String(ctx.chat.id)}`, deps.config.MASTER_ENCRYPTION_KEY).slice(0, 24);
+      const group = deps.db.getGroupByTelegramChatHash(chatHash);
+      if (!group) {
+        await ctx.reply("No group wallet exists yet.");
+        return;
+      }
+      await assertTelegramGroupAdmin(ctx, String(ctx.chat.id), String(ctx.from.id));
+      deps.walletManager.freezeGroupWallet(group.id);
+      await ctx.reply("Group wallet is frozen. Balance, deposit, and history still work.");
+    } catch (error) {
+      deps.logger.warn({ err: error instanceof Error ? { name: error.name, message: error.message } : String(error) }, "freeze command failed");
+      await replyWithError(ctx, error);
+    }
+  });
+  bot.command("unfreeze", async ctx => {
+    if (!ctx.from || !ctx.chat) return;
+    try {
+      if (ctx.chat.type === "private") {
+        deps.walletManager.unfreezeUserWallet(String(ctx.from.id));
+        await ctx.reply("Your wallet is active again.");
+        return;
+      }
+
+      const chatHash = hashSensitiveValue(`chat:${String(ctx.chat.id)}`, deps.config.MASTER_ENCRYPTION_KEY).slice(0, 24);
+      const group = deps.db.getGroupByTelegramChatHash(chatHash);
+      const user = deps.db.getUserByTelegramId(String(ctx.from.id));
+      if (!group || !user || !deps.walletManager.isGroupAdmin(group.id, user.id)) {
+        await ctx.reply("Only a group wallet owner/admin can unfreeze this wallet.");
+        return;
+      }
+      await assertTelegramGroupAdmin(ctx, String(ctx.chat.id), String(ctx.from.id));
+      deps.walletManager.unfreezeGroupWallet(group.id);
+      await ctx.reply("Group wallet is active again.");
+    } catch (error) {
+      deps.logger.warn({ err: error instanceof Error ? { name: error.name, message: error.message } : String(error) }, "unfreeze command failed");
+      await replyWithError(ctx, error);
+    }
+  });
+  bot.command("status", async ctx => {
+    if (!ctx.from || !ctx.chat) return;
+    if (ctx.chat.type === "private") {
+      const wallet = deps.walletManager.getUserWalletStatus(String(ctx.from.id));
+      await ctx.reply(`Wallet status: ${wallet?.status ?? "not created"}.`);
+      return;
+    }
+
+    const chatHash = hashSensitiveValue(`chat:${String(ctx.chat.id)}`, deps.config.MASTER_ENCRYPTION_KEY).slice(0, 24);
+    const group = deps.db.getGroupByTelegramChatHash(chatHash);
+    const wallet = group ? deps.db.getWalletByGroupId(group.id) : undefined;
+    await ctx.reply(`Group wallet status: ${wallet?.status ?? "not created"}.`);
+  });
   bot.command("groupwallet", createGroupWalletCommand(deps));
 
   bot.on("inline_query", createInlineQueryHandler(deps));
@@ -190,6 +251,21 @@ export function createBot(deps: {
           await ctx.answerCbQuery("This confirmation does not belong to your account.");
           return;
         }
+
+        if (quote.group_id !== null && quote.requires_group_admin_approval) {
+          if (!isGroupAdmin) {
+            await ctx.answerCbQuery("Only a group wallet owner or admin can confirm this request.");
+            return;
+          }
+
+          const telegramStatus = await assertTelegramGroupAdmin(ctx, chatId, telegramId);
+          deps.db.recordTelegramAdminVerification({
+            groupId: quote.group_id,
+            userId: user.id,
+            telegramStatus,
+            source: "getChatMember"
+          });
+        }
       }
 
       const stateJson = session?.state_json ?? "";
@@ -256,7 +332,7 @@ export function createBot(deps: {
         return;
       }
 
-      deps.db.updateQuoteStatus(quoteId, "cancelled");
+      deps.db.updateQuoteStatus(quoteId, "canceled");
       await ctx.answerCbQuery("Cancelled.");
       await ctx.reply("Pending call cancelled.");
     } catch (error) {

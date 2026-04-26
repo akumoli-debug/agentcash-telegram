@@ -1,53 +1,84 @@
-# Deployment Scaffold
+# Deployment
 
-This is deployment scaffolding for demos and staging-like testing. It is not a claim that the app is production-custody-safe.
+This app can be deployed for demos and staging-like operation. It is not production-custody-safe.
 
-## Local Production-Like Run
-
-1. Create `.env`:
+## Local Dev
 
 ```bash
 cp .env.example .env
 openssl rand -base64 32
+corepack pnpm install
+corepack pnpm dev
 ```
 
-Set at least:
+Use SQLite and local locks for local dev:
 
 ```bash
-MASTER_ENCRYPTION_KEY=...
-TELEGRAM_BOT_TOKEN=...
+DATABASE_PROVIDER=sqlite
+LOCK_PROVIDER=local
+AUDIT_SINK=database
+NODE_ENV=development
 ```
 
-2. Start with Docker Compose:
+## Staging
+
+Use the same config shape as production, but keep balances small and caps low:
 
 ```bash
+NODE_ENV=production
+DATABASE_PROVIDER=sqlite
+ALLOW_SQLITE_IN_PRODUCTION=true
+LOCK_PROVIDER=redis
+REDIS_URL=redis://redis:6379
+AUDIT_SINK=file
+HARD_SPEND_CAP_USDC=1
+SKIP_AGENTCASH_HEALTHCHECK=false
+ALLOW_UNQUOTED_DEV_CALLS=false
+```
+
+The compose file includes Postgres and Redis. The app still uses SQLite by explicit override because the Postgres repository layer is not fully wired yet. Postgres migrations can be tested with `corepack pnpm db:migrate`.
+
+## Production-Like Compose
+
+```bash
+cp .env.example .env
 docker compose up --build
+curl http://localhost:3001/healthz
+curl http://localhost:3001/readyz
+curl http://localhost:3001/metrics
 ```
 
-3. Check health:
+Services:
+
+- `app`
+- `postgres`
+- `redis`
+- optional `audit-sink-mock` profile
+
+Audit sink mock:
 
 ```bash
-curl http://localhost:3001/healthz
+docker compose --profile audit-mock up --build
 ```
 
-The health endpoint only confirms the Node process is running. It does not prove AgentCash CLI health, webhook reachability, database durability, or custody safety.
+## Required Secrets
 
-## Webhook Mode
+- `MASTER_ENCRYPTION_KEY`
+- at least one of `TELEGRAM_BOT_TOKEN` or `DISCORD_BOT_TOKEN`
+- `DISCORD_APPLICATION_ID` when Discord is enabled
+- `WEBHOOK_SECRET_TOKEN` when `BOT_MODE=webhook`
+- `REDIS_URL` when `LOCK_PROVIDER=redis`
+- `DATABASE_URL` when `DATABASE_PROVIDER=postgres`
+- `AUDIT_HTTP_ENDPOINT` when `AUDIT_SINK=http`
 
-Webhook mode is enabled with:
+## Telegram Webhook
 
 ```bash
 BOT_MODE=webhook
 WEBHOOK_DOMAIN=https://your-public-domain.example
 WEBHOOK_PATH=/telegram/webhook
-WEBHOOK_HOST=0.0.0.0
-WEBHOOK_PORT=3000
 WEBHOOK_SECRET_TOKEN=<long-random-secret>
 ```
-
-`WEBHOOK_SECRET_TOKEN` is required whenever `BOT_MODE=webhook`. Startup validation rejects webhook mode without it.
-
-Telegram webhook setup:
 
 ```bash
 curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
@@ -55,65 +86,31 @@ curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
   -d "secret_token=${WEBHOOK_SECRET_TOKEN}"
 ```
 
-The public URL must terminate HTTPS before traffic reaches the app. The Docker Compose file exposes port `3000`, but it does not provide TLS; put it behind a real reverse proxy or platform load balancer.
+Terminate HTTPS at the platform/load balancer. The app itself does not provide TLS.
 
-## Docker
+## Discord Commands
 
-Files:
-
-- `Dockerfile`
-- `.dockerignore`
-- `docker-compose.yml`
-
-The image runs:
+For dev guild instant updates:
 
 ```bash
+DISCORD_DEV_GUILD_ID=<guild-id>
 corepack pnpm start
 ```
 
-Data volumes:
+Global Discord commands can take time to propagate.
 
-- `/app/.data` for SQLite
-- `/app/data/agentcash-homes` for AgentCash isolated home directories
+## Railway / Fly / Render Notes
 
-These volumes contain sensitive metadata and encrypted wallet material. Protect and back them up accordingly.
+- Set secrets through the platform secret manager, not `.env` committed to git.
+- Expose the webhook port and health port according to the platform model.
+- Use managed Redis for `LOCK_PROVIDER=redis`.
+- Use managed Postgres only after the repository adapter is fully wired and tested.
+- Keep `AUDIT_SINK=file` or `AUDIT_SINK=http`; database-only audit is not enough for production.
 
-## SQLite Is Local-Only
+## Operational Caveats
 
-SQLite remains the default because it is simple for local demos and tests. It is not suitable for horizontally scaled production:
-
-- no cross-process write coordination beyond SQLite file locks
-- no managed backup/restore workflow here
-- no online migration framework
-- no distributed transaction or advisory-lock integration
-
-Tables that need a real migration plan before production:
-
-- `users`
-- `delivery_identities`
-- `groups`
-- `group_members`
-- `wallets`
-- `quotes`
-- `transactions`
-- `preflight_attempts`
-- `audit_events`
-- `inline_payloads`
-- `sessions`
-- `request_events`
-
-`src/db/adapter.ts` contains a small adapter seam and a Postgres migration TODO list. There is no partial Postgres implementation because the tests and transactional behavior have not been migrated end to end.
-
-## Locks
-
-The app now uses a `LockManager` interface with a `LocalLockManager` implementation. Local locks protect wallet provisioning, quote approval, and paid execution inside one Node process.
-
-This does not protect multiple replicas. Real production needs a distributed lock with:
-
-- TTL
-- unique ownership token
-- compare-and-delete release script
-- monitoring for lock contention and expired locks
-- tests under multi-process execution
-
-Redis is not wired in this scaffold because an unsafe lock is worse than no lock.
+- `/healthz` only proves the process is alive.
+- `/readyz` checks dependencies.
+- SQLite in production requires an explicit unsafe override and is not horizontally safe.
+- Redis locks do not replace DB idempotency.
+- Custody remains demo-only unless remote signer/KMS is completed and reviewed.
