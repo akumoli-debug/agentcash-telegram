@@ -69,12 +69,27 @@ export interface QuoteRow {
   quoted_cost_cents: number;
   max_approved_cost_cents: number;
   is_dev_unquoted: number;
-  status: "pending" | "approved" | "executing" | "succeeded" | "expired" | "canceled" | "failed";
+  status:
+    | "pending"
+    | "approved"
+    | "executing"
+    | "succeeded"
+    | "expired"
+    | "canceled"
+    | "failed"
+    | "execution_unknown";
   created_at: string;
   expires_at: string;
   approved_at: string | null;
   executed_at: string | null;
   transaction_id: string | null;
+  execution_started_at: string | null;
+  execution_lease_expires_at: string | null;
+  execution_attempt_count: number;
+  last_execution_error: string | null;
+  upstream_idempotency_key: string | null;
+  reconciliation_status: string | null;
+  reconciled_at: string | null;
   requester_user_id: string | null;
   group_id: string | null;
   requires_group_admin_approval: number;
@@ -227,6 +242,130 @@ export interface AuditEventInput {
   metadata?: Record<string, string | number | boolean | null>;
 }
 
+export interface BeginQuoteExecutionInput {
+  leaseExpiresAt: string;
+  upstreamIdempotencyKey: string;
+}
+
+export interface StuckExecutionRow {
+  id: string;
+  wallet_id: string;
+  skill: string;
+  request_hash: string;
+  status: QuoteRow["status"];
+  execution_started_at: string | null;
+  execution_lease_expires_at: string | null;
+  execution_attempt_count: number;
+  last_execution_error: string | null;
+  upstream_idempotency_key: string | null;
+  reconciliation_status: string | null;
+  transaction_id: string | null;
+  created_at: string;
+}
+
+export interface PairingCodeRow {
+  id: string;
+  platform: string;
+  actor_id_hash: string;
+  code_hash: string;
+  status: "pending" | "approved" | "expired" | "revoked";
+  created_at: string;
+  expires_at: string;
+  approved_at: string | null;
+}
+
+export interface WalletPolicyRow {
+  id: string;
+  wallet_id: string;
+  daily_cap_usdc: number | null;
+  weekly_cap_usdc: number | null;
+  skill_allowlist: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SkillPolicyRow {
+  id: string;
+  wallet_id: string;
+  skill: string;
+  status: "allowed" | "trusted" | "blocked";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PolicyDecisionRow {
+  id: string;
+  quote_id: string;
+  wallet_id: string;
+  actor_id_hash: string | null;
+  outcome: string;
+  policy_type: string;
+  reason: string | null;
+  snapshot_json: string;
+  decided_at: string;
+}
+
+export interface SkillSpendRow {
+  skill: string;
+  cents: number;
+  count: number;
+}
+
+export interface ActorSpendRow {
+  actor_hash: string;
+  cents: number;
+  count: number;
+}
+
+export interface EndpointSpendRow {
+  endpoint: string;
+  cents: number;
+  count: number;
+}
+
+export interface DailySpendRow {
+  date: string;
+  cents: number;
+}
+
+export interface QuoteStatsRow {
+  total: number;
+  succeeded: number;
+  denied: number;
+}
+
+export interface EstimatedVsActualRow {
+  estimatedCents: number;
+  actualCents: number;
+  count: number;
+}
+
+export interface TransactionExportRow {
+  date: string;
+  skill: string;
+  status: string;
+  estimated_usdc: string;
+  actual_usdc: string;
+  request_hash: string;
+}
+
+export interface AuditEventRow {
+  id: string;
+  event_name: string;
+  wallet_id: string | null;
+  quote_id: string | null;
+  transaction_id: string | null;
+  actor_hash: string | null;
+  group_id: string | null;
+  status: string | null;
+  metadata_json: string | null;
+  shipped_at: string | null;
+  ship_attempts: number;
+  last_ship_error: string | null;
+  sink_name: string | null;
+  created_at: string;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -239,9 +378,10 @@ function isValidQuoteTransition(from: QuoteRow["status"], to: QuoteRow["status"]
   const allowed: Record<QuoteRow["status"], QuoteRow["status"][]> = {
     pending: ["approved", "expired", "canceled"],
     approved: ["executing", "expired", "canceled"],
-    executing: ["succeeded", "failed"],
+    executing: ["succeeded", "failed", "execution_unknown"],
     succeeded: [],
     failed: [],
+    execution_unknown: [],
     expired: [],
     canceled: []
   };
@@ -310,10 +450,21 @@ export class AppDatabase {
     this.ensureQuoteColumn("platform", "TEXT NOT NULL DEFAULT 'telegram'");
     this.ensureQuoteColumn("actor_id_hash", "TEXT");
     this.ensureQuoteColumn("wallet_scope", "TEXT");
+    this.ensureQuoteColumn("execution_started_at", "TEXT");
+    this.ensureQuoteColumn("execution_lease_expires_at", "TEXT");
+    this.ensureQuoteColumn("execution_attempt_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureQuoteColumn("last_execution_error", "TEXT");
+    this.ensureQuoteColumn("upstream_idempotency_key", "TEXT");
+    this.ensureQuoteColumn("reconciliation_status", "TEXT");
+    this.ensureQuoteColumn("reconciled_at", "TEXT");
     this.ensureGroupColumn("platform", "TEXT NOT NULL DEFAULT 'telegram'");
     this.ensureGroupColumn("guild_id_hash", "TEXT");
     this.ensureGroupColumn("cap_enabled", "INTEGER NOT NULL DEFAULT 1");
     this.ensureGroupColumn("spend_cap_usdc", "REAL NOT NULL DEFAULT 0.5");
+    this.ensureAuditEventColumn("shipped_at", "TEXT");
+    this.ensureAuditEventColumn("ship_attempts", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureAuditEventColumn("last_ship_error", "TEXT");
+    this.ensureAuditEventColumn("sink_name", "TEXT");
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS groups (
         id TEXT PRIMARY KEY,
@@ -417,6 +568,10 @@ export class AppDatabase {
         group_id TEXT,
         status TEXT,
         metadata_json TEXT,
+        shipped_at TEXT,
+        ship_attempts INTEGER NOT NULL DEFAULT 0,
+        last_ship_error TEXT,
+        sink_name TEXT,
         created_at TEXT NOT NULL
       )
     `);
@@ -427,6 +582,10 @@ export class AppDatabase {
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS audit_events_quote_idx
       ON audit_events(quote_id, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS audit_events_unshipped_idx
+      ON audit_events(shipped_at, created_at ASC)
     `);
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS inline_payloads (
@@ -474,6 +633,13 @@ export class AppDatabase {
         approved_at TEXT,
         executed_at TEXT,
         transaction_id TEXT,
+        execution_started_at TEXT,
+        execution_lease_expires_at TEXT,
+        execution_attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_execution_error TEXT,
+        upstream_idempotency_key TEXT,
+        reconciliation_status TEXT,
+        reconciled_at TEXT,
         requester_user_id TEXT,
         group_id TEXT,
         requires_group_admin_approval INTEGER NOT NULL DEFAULT 0,
@@ -485,6 +651,10 @@ export class AppDatabase {
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS quotes_user_hash_created_at_idx
       ON quotes(user_hash, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS quotes_execution_reconciliation_idx
+      ON quotes(status, execution_lease_expires_at)
     `);
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS preflight_attempts (
@@ -511,6 +681,76 @@ export class AppDatabase {
         created_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL
       )
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS gateway_pairing_codes (
+        id TEXT PRIMARY KEY,
+        platform TEXT NOT NULL,
+        actor_id_hash TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'expired', 'revoked')),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        approved_at TEXT
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS gateway_pairing_codes_actor_platform_status_idx
+      ON gateway_pairing_codes(platform, actor_id_hash, status, expires_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS wallet_policies (
+        id TEXT PRIMARY KEY,
+        wallet_id TEXT NOT NULL UNIQUE,
+        daily_cap_usdc REAL,
+        weekly_cap_usdc REAL,
+        skill_allowlist TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (wallet_id) REFERENCES wallets(id)
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS skill_policies (
+        id TEXT PRIMARY KEY,
+        wallet_id TEXT NOT NULL,
+        skill TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'allowed' CHECK (status IN ('allowed', 'trusted', 'blocked')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (wallet_id) REFERENCES wallets(id),
+        UNIQUE (wallet_id, skill)
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS skill_policies_wallet_idx
+      ON skill_policies(wallet_id, skill)
+    `);
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS policy_decisions (
+        id TEXT PRIMARY KEY,
+        quote_id TEXT NOT NULL UNIQUE,
+        wallet_id TEXT NOT NULL,
+        actor_id_hash TEXT,
+        outcome TEXT NOT NULL,
+        policy_type TEXT NOT NULL,
+        reason TEXT,
+        snapshot_json TEXT NOT NULL,
+        decided_at TEXT NOT NULL,
+        FOREIGN KEY (quote_id) REFERENCES quotes(id)
+      )
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS policy_decisions_wallet_decided_at_idx
+      ON policy_decisions(wallet_id, decided_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS transactions_wallet_created_at_idx
+      ON transactions(wallet_id, created_at DESC)
+    `);
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS preflight_attempts_wallet_created_at_idx
+      ON preflight_attempts(wallet_id, created_at DESC)
     `);
   }
 
@@ -1247,16 +1487,27 @@ export class AppDatabase {
     return result.changes > 0;
   }
 
-  atomicBeginQuoteExecution(id: string): boolean {
+  atomicBeginQuoteExecution(id: string, input?: BeginQuoteExecutionInput): boolean {
+    const timestamp = nowIso();
+    const leaseExpiresAt = input?.leaseExpiresAt ?? new Date(Date.now() + 120_000).toISOString();
+    const upstreamIdempotencyKey = input?.upstreamIdempotencyKey ?? null;
     const result = this.sqlite
       .prepare(
         `
           UPDATE quotes
-          SET status = 'executing'
-          WHERE id = ? AND status = 'approved' AND expires_at > ?
+          SET status = 'executing',
+              approved_at = COALESCE(approved_at, ?),
+              execution_started_at = ?,
+              execution_lease_expires_at = ?,
+              execution_attempt_count = execution_attempt_count + 1,
+              last_execution_error = NULL,
+              upstream_idempotency_key = COALESCE(upstream_idempotency_key, ?),
+              reconciliation_status = NULL,
+              reconciled_at = NULL
+          WHERE id = ? AND status IN ('pending', 'approved') AND expires_at > ?
         `
       )
-      .run(id, nowIso()) as { changes: number };
+      .run(timestamp, timestamp, leaseExpiresAt, upstreamIdempotencyKey, id, timestamp) as { changes: number };
 
     if (result.changes > 0) {
       const quote = this.getQuote(id);
@@ -1273,25 +1524,163 @@ export class AppDatabase {
     return result.changes > 0;
   }
 
+  getLatestTransactionForQuote(quoteId: string): Record<string, unknown> | undefined {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT *
+          FROM transactions
+          WHERE quote_id = ?
+          ORDER BY created_at DESC
+          LIMIT 1
+        `
+      )
+      .get(quoteId) as Record<string, unknown> | undefined;
+  }
+
+  listExpiredExecutingQuotes(now = nowIso(), limit = 50): QuoteRow[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT *
+          FROM quotes
+          WHERE status = 'executing'
+            AND execution_lease_expires_at IS NOT NULL
+            AND execution_lease_expires_at <= ?
+          ORDER BY execution_lease_expires_at ASC
+          LIMIT ?
+        `
+      )
+      .all(now, limit) as QuoteRow[];
+  }
+
+  listStuckExecutions(limit = 50): StuckExecutionRow[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT
+            id,
+            wallet_id,
+            skill,
+            request_hash,
+            status,
+            execution_started_at,
+            execution_lease_expires_at,
+            execution_attempt_count,
+            last_execution_error,
+            upstream_idempotency_key,
+            reconciliation_status,
+            transaction_id,
+            created_at
+          FROM quotes
+          WHERE status IN ('executing', 'execution_unknown')
+          ORDER BY COALESCE(execution_lease_expires_at, created_at) ASC
+          LIMIT ?
+        `
+      )
+      .all(limit) as StuckExecutionRow[];
+  }
+
+  markQuoteExecutionUnknown(id: string, safeError: string): boolean {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE quotes
+          SET status = 'execution_unknown',
+              execution_lease_expires_at = NULL,
+              last_execution_error = ?,
+              reconciliation_status = 'operator_review_required',
+              reconciled_at = NULL
+          WHERE id = ? AND status = 'executing'
+        `
+      )
+      .run(safeError.slice(0, 512), id) as { changes: number };
+
+    if (result.changes > 0) {
+      const quote = this.getQuote(id);
+      this.createAuditEvent({
+        eventName: "quote.execution_unknown",
+        walletId: quote?.wallet_id ?? null,
+        quoteId: id,
+        actorHash: quote?.user_hash ?? null,
+        groupId: quote?.group_id ?? null,
+        status: "execution_unknown",
+        metadata: { reconciliationStatus: "operator_review_required" }
+      });
+    }
+
+    return result.changes > 0;
+  }
+
+  markExecutionReviewed(id: string): boolean {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE quotes
+          SET reconciliation_status = 'reviewed',
+              reconciled_at = ?
+          WHERE id = ? AND status = 'execution_unknown'
+        `
+      )
+      .run(nowIso(), id) as { changes: number };
+
+    if (result.changes > 0) {
+      const quote = this.getQuote(id);
+      this.createAuditEvent({
+        eventName: "quote.execution_reviewed",
+        walletId: quote?.wallet_id ?? null,
+        quoteId: id,
+        actorHash: quote?.user_hash ?? null,
+        groupId: quote?.group_id ?? null,
+        status: "reviewed"
+      });
+    }
+
+    return result.changes > 0;
+  }
+
   updateQuoteStatus(
     id: string,
     status: QuoteRow["status"],
-    extras?: { executedAt?: string; transactionId?: string }
+    extras?: { executedAt?: string; transactionId?: string; lastExecutionError?: string }
   ): void {
     this.sqlite
       .prepare(
         `
           UPDATE quotes
-          SET status = ?, executed_at = COALESCE(?, executed_at), transaction_id = COALESCE(?, transaction_id)
+          SET status = ?,
+              executed_at = COALESCE(?, executed_at),
+              transaction_id = COALESCE(?, transaction_id),
+              execution_lease_expires_at = CASE WHEN ? IN ('succeeded', 'failed', 'execution_unknown') THEN NULL ELSE execution_lease_expires_at END,
+              last_execution_error = COALESCE(?, last_execution_error),
+              reconciliation_status = CASE
+                WHEN ? = 'execution_unknown' THEN 'operator_review_required'
+                WHEN ? IN ('succeeded', 'failed') THEN 'not_required'
+                ELSE reconciliation_status
+              END
           WHERE id = ?
         `
       )
-      .run(status, extras?.executedAt ?? null, extras?.transactionId ?? null, id);
+      .run(
+        status,
+        extras?.executedAt ?? null,
+        extras?.transactionId ?? null,
+        status,
+        extras?.lastExecutionError ? extras.lastExecutionError.slice(0, 512) : null,
+        status,
+        status,
+        id
+      );
 
-    if (status === "expired" || status === "canceled" || status === "failed") {
+    if (status === "expired" || status === "canceled" || status === "failed" || status === "execution_unknown") {
       const quote = this.getQuote(id);
       this.createAuditEvent({
-        eventName: status === "expired" ? "quote.expired" : "quote.rejected",
+        eventName:
+          status === "expired"
+            ? "quote.expired"
+            : status === "execution_unknown"
+            ? "quote.execution_unknown"
+            : "quote.rejected",
         walletId: quote?.wallet_id ?? null,
         quoteId: id,
         transactionId: extras?.transactionId ?? quote?.transaction_id ?? null,
@@ -1306,7 +1695,7 @@ export class AppDatabase {
     id: string,
     from: QuoteRow["status"],
     to: QuoteRow["status"],
-    extras?: { executedAt?: string; transactionId?: string }
+    extras?: { executedAt?: string; transactionId?: string; lastExecutionError?: string }
   ): boolean {
     if (!isValidQuoteTransition(from, to)) {
       return false;
@@ -1316,11 +1705,30 @@ export class AppDatabase {
       .prepare(
         `
           UPDATE quotes
-          SET status = ?, executed_at = COALESCE(?, executed_at), transaction_id = COALESCE(?, transaction_id)
+          SET status = ?,
+              executed_at = COALESCE(?, executed_at),
+              transaction_id = COALESCE(?, transaction_id),
+              execution_lease_expires_at = CASE WHEN ? IN ('succeeded', 'failed', 'execution_unknown') THEN NULL ELSE execution_lease_expires_at END,
+              last_execution_error = COALESCE(?, last_execution_error),
+              reconciliation_status = CASE
+                WHEN ? = 'execution_unknown' THEN 'operator_review_required'
+                WHEN ? IN ('succeeded', 'failed') THEN 'not_required'
+                ELSE reconciliation_status
+              END
           WHERE id = ? AND status = ?
         `
       )
-      .run(to, extras?.executedAt ?? null, extras?.transactionId ?? null, id, from) as { changes: number };
+      .run(
+        to,
+        extras?.executedAt ?? null,
+        extras?.transactionId ?? null,
+        to,
+        extras?.lastExecutionError ? extras.lastExecutionError.slice(0, 512) : null,
+        to,
+        to,
+        id,
+        from
+      ) as { changes: number };
 
     if (result.changes > 0) {
       const quote = this.getQuote(id);
@@ -1329,6 +1737,8 @@ export class AppDatabase {
           ? "quote_execution_succeeded"
           : to === "failed"
           ? "quote_execution_failed"
+          : to === "execution_unknown"
+          ? "quote_execution_unknown"
           : to === "canceled"
           ? "quote_canceled"
           : to === "expired"
@@ -1593,7 +2003,7 @@ export class AppDatabase {
         timestamp
       );
 
-    if (input.status === "submitted") {
+    if (input.status === "submitted" || input.status === "success") {
       this.createAuditEvent({
         eventName: "paid_call.submitted",
         walletId: input.walletId ?? null,
@@ -1827,6 +2237,476 @@ export class AppDatabase {
       );
   }
 
+  listUnshippedAuditEvents(limit = 50): AuditEventRow[] {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT *
+          FROM audit_events
+          WHERE shipped_at IS NULL
+          ORDER BY created_at ASC
+          LIMIT ?
+        `
+      )
+      .all(limit) as AuditEventRow[];
+  }
+
+  markAuditEventShipped(id: string, sinkName: string, shippedAt = nowIso()): void {
+    this.sqlite
+      .prepare(
+        `
+          UPDATE audit_events
+          SET shipped_at = ?, sink_name = ?, last_ship_error = NULL
+          WHERE id = ? AND shipped_at IS NULL
+        `
+      )
+      .run(shippedAt, sinkName, id);
+  }
+
+  markAuditEventShipFailed(id: string, sinkName: string, error: string): void {
+    this.sqlite
+      .prepare(
+        `
+          UPDATE audit_events
+          SET ship_attempts = ship_attempts + 1,
+              last_ship_error = ?,
+              sink_name = ?
+          WHERE id = ? AND shipped_at IS NULL
+        `
+      )
+      .run(error.slice(0, 512), sinkName, id);
+  }
+
+  createPairingCode(input: {
+    id: string;
+    platform: string;
+    actorIdHash: string;
+    codeHash: string;
+    expiresAt: string;
+  }): PairingCodeRow {
+    const timestamp = nowIso();
+    this.sqlite
+      .prepare(
+        `
+          INSERT INTO gateway_pairing_codes (
+            id, platform, actor_id_hash, code_hash, status, created_at, expires_at, approved_at
+          ) VALUES (?, ?, ?, ?, 'pending', ?, ?, NULL)
+        `
+      )
+      .run(input.id, input.platform, input.actorIdHash, input.codeHash, timestamp, input.expiresAt);
+
+    this.createAuditEvent({
+      eventName: "gateway_pairing.code_issued",
+      actorHash: input.actorIdHash,
+      status: "pending",
+      metadata: { platform: input.platform }
+    });
+
+    return this.sqlite
+      .prepare("SELECT * FROM gateway_pairing_codes WHERE id = ?")
+      .get(input.id) as PairingCodeRow;
+  }
+
+  getPendingPairingCode(platform: string, actorIdHash: string, now = nowIso()): PairingCodeRow | undefined {
+    return this.sqlite
+      .prepare(
+        `
+          SELECT * FROM gateway_pairing_codes
+          WHERE platform = ? AND actor_id_hash = ? AND status = 'pending' AND expires_at > ?
+          ORDER BY expires_at DESC
+          LIMIT 1
+        `
+      )
+      .get(platform, actorIdHash, now) as PairingCodeRow | undefined;
+  }
+
+  expireActorPairingCodes(platform: string, actorIdHash: string): void {
+    this.sqlite
+      .prepare(
+        `
+          UPDATE gateway_pairing_codes
+          SET status = 'expired'
+          WHERE platform = ? AND actor_id_hash = ? AND status = 'pending'
+        `
+      )
+      .run(platform, actorIdHash);
+  }
+
+  approvePairingCode(id: string): boolean {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE gateway_pairing_codes
+          SET status = 'approved', approved_at = ?
+          WHERE id = ? AND status = 'pending' AND expires_at > ?
+        `
+      )
+      .run(nowIso(), id, nowIso()) as { changes: number };
+
+    if (result.changes > 0) {
+      const row = this.sqlite
+        .prepare("SELECT * FROM gateway_pairing_codes WHERE id = ?")
+        .get(id) as PairingCodeRow;
+      this.createAuditEvent({
+        eventName: "gateway_pairing.code_approved",
+        actorHash: row.actor_id_hash,
+        status: "approved",
+        metadata: { platform: row.platform }
+      });
+    }
+
+    return result.changes > 0;
+  }
+
+  revokeActorPairingCodes(platform: string, actorIdHash: string): number {
+    const result = this.sqlite
+      .prepare(
+        `
+          UPDATE gateway_pairing_codes
+          SET status = 'revoked'
+          WHERE platform = ? AND actor_id_hash = ? AND status IN ('pending', 'approved')
+        `
+      )
+      .run(platform, actorIdHash) as { changes: number };
+
+    if (result.changes > 0) {
+      this.createAuditEvent({
+        eventName: "gateway_pairing.codes_revoked",
+        actorHash: actorIdHash,
+        status: "revoked",
+        metadata: { platform, count: result.changes }
+      });
+    }
+
+    return result.changes;
+  }
+
+  listApprovedPairingActors(platform: string, now = nowIso()): string[] {
+    const rows = this.sqlite
+      .prepare(
+        `
+          SELECT DISTINCT actor_id_hash
+          FROM gateway_pairing_codes
+          WHERE platform = ? AND status = 'approved' AND expires_at > ?
+        `
+      )
+      .all(platform, now) as Array<{ actor_id_hash: string }>;
+
+    return rows.map(r => r.actor_id_hash);
+  }
+
+  getWalletPolicy(walletId: string): WalletPolicyRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM wallet_policies WHERE wallet_id = ?")
+      .get(walletId) as WalletPolicyRow | undefined;
+  }
+
+  upsertWalletPolicy(
+    walletId: string,
+    input: { dailyCapUsdc?: number | null; weeklyCapUsdc?: number | null; skillAllowlist?: string | null }
+  ): WalletPolicyRow {
+    const existing = this.getWalletPolicy(walletId);
+    const timestamp = nowIso();
+
+    if (existing) {
+      this.sqlite
+        .prepare(
+          `UPDATE wallet_policies
+           SET daily_cap_usdc = ?, weekly_cap_usdc = ?, skill_allowlist = ?, updated_at = ?
+           WHERE wallet_id = ?`
+        )
+        .run(
+          input.dailyCapUsdc !== undefined ? input.dailyCapUsdc : existing.daily_cap_usdc,
+          input.weeklyCapUsdc !== undefined ? input.weeklyCapUsdc : existing.weekly_cap_usdc,
+          input.skillAllowlist !== undefined ? input.skillAllowlist : existing.skill_allowlist,
+          timestamp,
+          walletId
+        );
+    } else {
+      this.sqlite
+        .prepare(
+          `INSERT INTO wallet_policies (id, wallet_id, daily_cap_usdc, weekly_cap_usdc, skill_allowlist, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          makeId("wpl"),
+          walletId,
+          input.dailyCapUsdc ?? null,
+          input.weeklyCapUsdc ?? null,
+          input.skillAllowlist ?? null,
+          timestamp,
+          timestamp
+        );
+    }
+
+    return this.getWalletPolicy(walletId)!;
+  }
+
+  getSkillPolicy(walletId: string, skill: string): SkillPolicyRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM skill_policies WHERE wallet_id = ? AND skill = ?")
+      .get(walletId, skill) as SkillPolicyRow | undefined;
+  }
+
+  upsertSkillPolicy(walletId: string, skill: string, status: "allowed" | "trusted" | "blocked"): SkillPolicyRow {
+    const existing = this.getSkillPolicy(walletId, skill);
+    const timestamp = nowIso();
+
+    if (existing) {
+      this.sqlite
+        .prepare("UPDATE skill_policies SET status = ?, updated_at = ? WHERE wallet_id = ? AND skill = ?")
+        .run(status, timestamp, walletId, skill);
+    } else {
+      this.sqlite
+        .prepare(
+          `INSERT INTO skill_policies (id, wallet_id, skill, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(makeId("spl"), walletId, skill, status, timestamp, timestamp);
+    }
+
+    return this.getSkillPolicy(walletId, skill)!;
+  }
+
+  getWalletSpendCents(walletId: string, sinceIso: string): number {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS total
+         FROM transactions
+         WHERE wallet_id = ? AND created_at >= ? AND status IN ('submitted', 'success')`
+      )
+      .get(walletId, sinceIso) as { total: number };
+    return row.total;
+  }
+
+  hasWalletSucceededTransactions(walletId: string): boolean {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS count FROM transactions
+         WHERE wallet_id = ? AND status IN ('submitted', 'success') LIMIT 1`
+      )
+      .get(walletId) as { count: number };
+    return row.count > 0;
+  }
+
+  recordPolicyDecision(
+    quoteId: string,
+    walletId: string,
+    actorIdHash: string | null,
+    decision: { outcome: string; policyType: string; reason: string; snapshotJson: string }
+  ): PolicyDecisionRow {
+    const id = makeId("pol");
+    const timestamp = nowIso();
+    this.sqlite
+      .prepare(
+        `INSERT INTO policy_decisions (id, quote_id, wallet_id, actor_id_hash, outcome, policy_type, reason, snapshot_json, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, quoteId, walletId, actorIdHash, decision.outcome, decision.policyType, decision.reason, decision.snapshotJson, timestamp);
+
+    return this.sqlite.prepare("SELECT * FROM policy_decisions WHERE id = ?").get(id) as PolicyDecisionRow;
+  }
+
+  getPolicyDecision(quoteId: string): PolicyDecisionRow | undefined {
+    return this.sqlite
+      .prepare("SELECT * FROM policy_decisions WHERE quote_id = ?")
+      .get(quoteId) as PolicyDecisionRow | undefined;
+  }
+
+  // ─── Spend analytics ───────────────────────────────────────────────────────
+
+  private txSpendBySkill(col: "wallet_id" | "group_id", id: string, sinceIso: string): SkillSpendRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT COALESCE(skill, 'unknown') AS skill,
+                COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS cents,
+                COUNT(*) AS count
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ? AND status IN ('submitted', 'success')
+         GROUP BY skill ORDER BY cents DESC`
+      )
+      .all(id, sinceIso) as SkillSpendRow[];
+  }
+
+  getWalletSpendBySkill(walletId: string, sinceIso: string): SkillSpendRow[] {
+    return this.txSpendBySkill("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupSpendBySkill(groupId: string, sinceIso: string): SkillSpendRow[] {
+    return this.txSpendBySkill("group_id", groupId, sinceIso);
+  }
+
+  private txSpendByActor(col: "wallet_id" | "group_id", id: string, sinceIso: string): ActorSpendRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT COALESCE(telegram_id_hash, 'unknown') AS actor_hash,
+                COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS cents,
+                COUNT(*) AS count
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ? AND status IN ('submitted', 'success')
+         GROUP BY telegram_id_hash ORDER BY cents DESC LIMIT 20`
+      )
+      .all(id, sinceIso) as ActorSpendRow[];
+  }
+
+  getWalletSpendByActor(walletId: string, sinceIso: string): ActorSpendRow[] {
+    return this.txSpendByActor("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupSpendByActor(groupId: string, sinceIso: string): ActorSpendRow[] {
+    return this.txSpendByActor("group_id", groupId, sinceIso);
+  }
+
+  private txSpendByEndpoint(col: "wallet_id" | "group_id", id: string, sinceIso: string): EndpointSpendRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT COALESCE(endpoint, 'unknown') AS endpoint,
+                COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS cents,
+                COUNT(*) AS count
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ? AND status IN ('submitted', 'success')
+         GROUP BY endpoint ORDER BY cents DESC LIMIT 5`
+      )
+      .all(id, sinceIso) as EndpointSpendRow[];
+  }
+
+  getWalletSpendByEndpoint(walletId: string, sinceIso: string): EndpointSpendRow[] {
+    return this.txSpendByEndpoint("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupSpendByEndpoint(groupId: string, sinceIso: string): EndpointSpendRow[] {
+    return this.txSpendByEndpoint("group_id", groupId, sinceIso);
+  }
+
+  private txDailySpendSeries(col: "wallet_id" | "group_id", id: string, sinceIso: string): DailySpendRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT DATE(created_at) AS date,
+                COALESCE(SUM(COALESCE(actual_cost_cents, estimated_cost_cents, 0)), 0) AS cents
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ? AND status IN ('submitted', 'success')
+         GROUP BY DATE(created_at) ORDER BY date ASC`
+      )
+      .all(id, sinceIso) as DailySpendRow[];
+  }
+
+  getWalletDailySpendSeries(walletId: string, sinceIso: string): DailySpendRow[] {
+    return this.txDailySpendSeries("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupDailySpendSeries(groupId: string, sinceIso: string): DailySpendRow[] {
+    return this.txDailySpendSeries("group_id", groupId, sinceIso);
+  }
+
+  getWalletQuoteStats(walletId: string, sinceIso: string): QuoteStatsRow {
+    const total = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM quotes WHERE wallet_id = ? AND created_at >= ?`)
+        .get(walletId, sinceIso) as { n: number }
+    ).n;
+    const succeeded = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM quotes WHERE wallet_id = ? AND created_at >= ? AND status = 'succeeded'`)
+        .get(walletId, sinceIso) as { n: number }
+    ).n;
+    const denied = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM policy_decisions WHERE wallet_id = ? AND decided_at >= ? AND outcome LIKE 'deny_%'`)
+        .get(walletId, sinceIso) as { n: number }
+    ).n;
+    return { total, succeeded, denied };
+  }
+
+  getGroupQuoteStats(groupId: string, walletId: string, sinceIso: string): QuoteStatsRow {
+    const total = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM quotes WHERE group_id = ? AND created_at >= ?`)
+        .get(groupId, sinceIso) as { n: number }
+    ).n;
+    const succeeded = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM quotes WHERE group_id = ? AND created_at >= ? AND status = 'succeeded'`)
+        .get(groupId, sinceIso) as { n: number }
+    ).n;
+    const denied = (
+      this.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM policy_decisions WHERE wallet_id = ? AND decided_at >= ? AND outcome LIKE 'deny_%'`)
+        .get(walletId, sinceIso) as { n: number }
+    ).n;
+    return { total, succeeded, denied };
+  }
+
+  getWalletFailedTransactionCount(walletId: string, sinceIso: string): number {
+    const row = this.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM transactions WHERE wallet_id = ? AND created_at >= ? AND status = 'error'`)
+      .get(walletId, sinceIso) as { n: number };
+    return row.n;
+  }
+
+  getGroupFailedTransactionCount(groupId: string, sinceIso: string): number {
+    const row = this.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM transactions WHERE group_id = ? AND created_at >= ? AND status = 'error'`)
+      .get(groupId, sinceIso) as { n: number };
+    return row.n;
+  }
+
+  getWalletReplayAttemptCount(walletId: string, sinceIso: string): number {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS n FROM preflight_attempts
+         WHERE wallet_id = ? AND created_at >= ? AND failure_stage = 'replay'`
+      )
+      .get(walletId, sinceIso) as { n: number };
+    return row.n;
+  }
+
+  private txEstimatedVsActual(col: "wallet_id" | "group_id", id: string, sinceIso: string): EstimatedVsActualRow {
+    const row = this.sqlite
+      .prepare(
+        `SELECT COALESCE(AVG(estimated_cost_cents), 0) AS estimatedCents,
+                COALESCE(AVG(actual_cost_cents), 0) AS actualCents,
+                COUNT(*) AS count
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ?
+           AND status IN ('submitted', 'success')
+           AND estimated_cost_cents IS NOT NULL
+           AND actual_cost_cents IS NOT NULL`
+      )
+      .get(id, sinceIso) as EstimatedVsActualRow;
+    return row;
+  }
+
+  getWalletEstimatedVsActual(walletId: string, sinceIso: string): EstimatedVsActualRow {
+    return this.txEstimatedVsActual("wallet_id", walletId, sinceIso);
+  }
+
+  getGroupEstimatedVsActual(groupId: string, sinceIso: string): EstimatedVsActualRow {
+    return this.txEstimatedVsActual("group_id", groupId, sinceIso);
+  }
+
+  getTransactionsForExport(
+    filter: { walletId: string } | { groupId: string },
+    sinceIso: string,
+    limit = 500
+  ): TransactionExportRow[] {
+    const col = "walletId" in filter ? "wallet_id" : "group_id";
+    const id = "walletId" in filter ? filter.walletId : filter.groupId;
+    return this.sqlite
+      .prepare(
+        `SELECT DATE(created_at) AS date,
+                COALESCE(skill, 'unknown') AS skill,
+                status,
+                COALESCE(CAST(estimated_cost_cents AS REAL) / 100, 0) AS estimated_usdc,
+                COALESCE(CAST(actual_cost_cents AS REAL) / 100, 0) AS actual_usdc,
+                COALESCE(request_hash, '') AS request_hash
+         FROM transactions
+         WHERE ${col} = ? AND created_at >= ?
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(id, sinceIso, limit) as TransactionExportRow[];
+  }
+
   private ensureWalletColumn(name: string, type: string) {
     const columns = this.sqlite.prepare("PRAGMA table_info(wallets)").all() as Array<{ name: string }>;
 
@@ -1875,5 +2755,15 @@ export class AppDatabase {
     }
 
     this.sqlite.exec(`ALTER TABLE groups ADD COLUMN ${name} ${type}`);
+  }
+
+  private ensureAuditEventColumn(name: string, type: string) {
+    const columns = this.sqlite.prepare("PRAGMA table_info(audit_events)").all() as Array<{ name: string }>;
+
+    if (columns.some(column => column.name === name)) {
+      return;
+    }
+
+    this.sqlite.exec(`ALTER TABLE audit_events ADD COLUMN ${name} ${type}`);
   }
 }

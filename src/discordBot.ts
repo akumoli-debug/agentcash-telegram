@@ -23,10 +23,12 @@ import {
   runSkillCommand
 } from "./core/commandHandlers.js";
 import type { AppDatabase } from "./db/client.js";
+import { SpendAnalyticsService } from "./analytics/SpendAnalyticsService.js";
 import { hashSensitiveValue } from "./lib/crypto.js";
 import { QuoteError, ValidationError } from "./lib/errors.js";
 import type { AppLogger } from "./lib/logger.js";
 import { WalletManager } from "./wallets/walletManager.js";
+import { evaluatePolicy, type SecurityPolicyConfig } from "./gateway/securityPolicy.js";
 
 const CONFIRM_PREFIX = "discord_confirm:";
 const CANCEL_PREFIX = "discord_cancel:";
@@ -39,7 +41,8 @@ export interface DiscordDeps {
   skillExecutor: SkillExecutor;
 }
 
-export function createDiscordBot(deps: DiscordDeps): Client {
+export function createDiscordBot(deps: DiscordDeps & { securityPolicy: SecurityPolicyConfig }): Client {
+  const { securityPolicy } = deps;
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
 
   client.once(Events.ClientReady, readyClient => {
@@ -48,6 +51,51 @@ export function createDiscordBot(deps: DiscordDeps): Client {
 
   client.on(Events.InteractionCreate, async interaction => {
     try {
+      // Always ignore bot-authored interactions (bots cannot send slash commands,
+      // but guard defensively).
+      if (interaction.user.bot) {
+        return;
+      }
+
+      // Evaluate gateway security policy before any command handling.
+      const actorIdHash = hashDiscordId(interaction.user.id, deps.config);
+      const channelId = interaction.channelId ?? interaction.user.id;
+      const chatIdHash = hashDiscordId(channelId, deps.config);
+      const isGuild = Boolean(interaction.guildId);
+      const chatType = isGuild ? "guild" as const : "private" as const;
+
+      const decision = evaluatePolicy(
+        {
+          platform: "discord",
+          actorIdHash,
+          chatIdHash,
+          chatType,
+          isCommand: true,
+          commandName: interaction.isChatInputCommand() ? interaction.options.getSubcommandGroup(false) ?? interaction.options.getSubcommand(false) ?? undefined : undefined,
+          botWasMentioned: false,
+          messageAuthorIsBot: interaction.user.bot ?? false,
+          walletScopeRequested: isGuild ? "guild" : "user",
+          isCallbackQuery: interaction.isButton()
+        },
+        securityPolicy
+      );
+
+      if (decision.result === "deny_silent") {
+        return;
+      }
+      if (decision.result === "deny_with_dm_instruction") {
+        await replyToInteraction(interaction, "Use DM commands for private wallet operations.", true);
+        return;
+      }
+      if (decision.result === "deny_with_allowlist_message") {
+        await replyToInteraction(interaction, "This bot is restricted to approved users. Contact the operator to request access.", true);
+        return;
+      }
+      if (decision.result === "require_pairing") {
+        await replyToInteraction(interaction, "You need to pair your account first. DM the bot to get a pairing code.", true);
+        return;
+      }
+
       if (interaction.isChatInputCommand() && interaction.commandName === "ac") {
         await handleSlashCommand(interaction, deps);
         return;
@@ -109,6 +157,7 @@ export function buildDiscordCommandPayload(): unknown[] {
               )
           )
           .addSubcommand(sub => sub.setName("history").setDescription("Show your private wallet history"))
+          .addSubcommand(sub => sub.setName("policy").setDescription("Show your user wallet spend policy"))
           .addSubcommand(sub =>
             sub
               .setName("research")
@@ -117,6 +166,13 @@ export function buildDiscordCommandPayload(): unknown[] {
                 option.setName("query").setDescription("Research query").setRequired(true).setMaxLength(300)
               )
           )
+      )
+      .addSubcommandGroup(group =>
+        group
+          .setName("spend")
+          .setDescription("User wallet spend analytics")
+          .addSubcommand(sub => sub.setName("today").setDescription("Today's spend summary"))
+          .addSubcommand(sub => sub.setName("week").setDescription("Last 7 days spend summary"))
       )
       .addSubcommandGroup(group =>
         group
@@ -144,7 +200,9 @@ export function buildDiscordCommandPayload(): unknown[] {
               )
           )
           .addSubcommand(sub => sub.setName("history").setDescription("Show guild wallet history"))
+          .addSubcommand(sub => sub.setName("policy").setDescription("Show guild wallet spend policy"))
           .addSubcommand(sub => sub.setName("sync-admins").setDescription("Sync Discord managers to guild wallet admins"))
+          .addSubcommand(sub => sub.setName("spend").setDescription("Guild spend analytics (admin only)"))
           .addSubcommand(sub =>
             sub
               .setName("research")
@@ -397,9 +455,91 @@ export async function handleSlashCommand(interaction: ChatInputCommandInteractio
     return;
   }
 
+  if (group === "wallet" && subcommand === "policy") {
+    const discordId = `discord:${interaction.user.id}`;
+    const user = deps.db.getUserByTelegramId(discordId);
+    const wallet = user ? deps.db.getWalletByUserId(user.id) : undefined;
+    const confirmationCapUsdc = user ? deps.walletManager.getConfirmationCap(user) : undefined;
+    const walletPolicy = wallet ? deps.db.getWalletPolicy(wallet.id) : undefined;
+
+    const dailyCapLine =
+      walletPolicy?.daily_cap_usdc !== null && walletPolicy?.daily_cap_usdc !== undefined
+        ? `$${walletPolicy.daily_cap_usdc.toFixed(2)}`
+        : deps.config.POLICY_DAILY_CAP_USDC !== undefined
+        ? `$${deps.config.POLICY_DAILY_CAP_USDC.toFixed(2)} (global)`
+        : "unlimited";
+
+    const weeklyCapLine =
+      walletPolicy?.weekly_cap_usdc !== null && walletPolicy?.weekly_cap_usdc !== undefined
+        ? `$${walletPolicy.weekly_cap_usdc.toFixed(2)}`
+        : deps.config.POLICY_WEEKLY_CAP_USDC !== undefined
+        ? `$${deps.config.POLICY_WEEKLY_CAP_USDC.toFixed(2)} (global)`
+        : "unlimited";
+
+    await replyToInteraction(
+      interaction,
+      [
+        `Wallet status: ${wallet?.status ?? "not created"}`,
+        `Per-call cap: ${confirmationCapUsdc !== undefined ? `$${confirmationCapUsdc.toFixed(2)}` : "disabled"}`,
+        `Daily cap: ${dailyCapLine}`,
+        `Weekly cap: ${weeklyCapLine}`
+      ].join("\n"),
+      true
+    );
+    return;
+  }
+
   if (group === "wallet" && subcommand === "research") {
     const query = interaction.options.getString("query", true);
     await runSkillCommand(ctx, deps, "research", query);
+    return;
+  }
+
+  if (group === "spend") {
+    const discordId = `discord:${interaction.user.id}`;
+    const user = deps.db.getUserByTelegramId(discordId);
+    const wallet = user ? deps.db.getWalletByUserId(user.id) : undefined;
+    const analytics = new SpendAnalyticsService(deps.db);
+
+    if (!wallet) {
+      await replyToInteraction(interaction, "No wallet found. Use /ac wallet balance to set one up.", true);
+      return;
+    }
+
+    if (subcommand === "today") {
+      const summary = analytics.getWalletSummary(wallet.id, 1);
+      const lines = [
+        "Today's spend",
+        `Today: $${(summary.totalCentsToday / 100).toFixed(4)}`
+      ];
+      if (summary.bySkill.length > 0) {
+        lines.push("", "By skill:");
+        for (const row of summary.bySkill) {
+          lines.push(`  ${row.skill}  $${(row.cents / 100).toFixed(4)}  ${row.count} call${row.count === 1 ? "" : "s"}`);
+        }
+      }
+      await replyToInteraction(interaction, lines.join("\n"), true);
+      return;
+    }
+
+    if (subcommand === "week") {
+      const summary = analytics.getWalletSummary(wallet.id, 7);
+      const lines = [
+        "Spend last 7 days",
+        `Today:       $${(summary.totalCentsToday / 100).toFixed(4)}`,
+        `Last 7 days: $${(summary.totalCentsLast7Days / 100).toFixed(4)}`
+      ];
+      if (summary.bySkill.length > 0) {
+        lines.push("", "By skill:");
+        for (const row of summary.bySkill) {
+          lines.push(`  ${row.skill}  $${(row.cents / 100).toFixed(4)}  ${row.count} call${row.count === 1 ? "" : "s"}`);
+        }
+      }
+      await replyToInteraction(interaction, lines.join("\n"), true);
+      return;
+    }
+
+    await replyToInteraction(interaction, "Unknown spend subcommand.", true);
     return;
   }
 
@@ -550,12 +690,49 @@ async function handleGuildCommand(
     return;
   }
 
+  if (subcommand === "policy") {
+    const walletPolicy = deps.db.getWalletPolicy(context.group.wallet_id);
+    const perCallCap = deps.walletManager.getGroupConfirmationCap(context.group);
+    const dailyCapLine =
+      walletPolicy?.daily_cap_usdc !== null && walletPolicy?.daily_cap_usdc !== undefined
+        ? `$${walletPolicy.daily_cap_usdc.toFixed(2)}`
+        : `$${(deps.config.GROUP_DAILY_CAP_USDC ?? 25).toFixed(2)} (global)`;
+    const weeklyCapLine =
+      walletPolicy?.weekly_cap_usdc !== null && walletPolicy?.weekly_cap_usdc !== undefined
+        ? `$${walletPolicy.weekly_cap_usdc.toFixed(2)}`
+        : "unlimited";
+
+    await replyToInteraction(
+      interaction,
+      [
+        `Guild wallet status: ${deps.db.getWalletById(context.group.wallet_id)?.status ?? "not created"}`,
+        `Per-call cap: ${perCallCap !== undefined ? `$${perCallCap.toFixed(2)}` : "disabled"}`,
+        `Daily cap: ${dailyCapLine}`,
+        `Weekly cap: ${weeklyCapLine}`
+      ].join("\n"),
+      true
+    );
+    return;
+  }
+
   if (subcommand === "sync-admins") {
     assertDiscordGuildAdmin(interaction);
     const result = await syncDiscordGuildAdmins(interaction, deps, context.group.id);
     await replyToInteraction(
       interaction,
       `Guild wallet admin sync complete. Promoted: ${result.promoted}. Demoted: ${result.demoted}.`,
+      true
+    );
+    return;
+  }
+
+  if (subcommand === "spend") {
+    assertDiscordGuildAdmin(interaction);
+    const analytics = new SpendAnalyticsService(deps.db);
+    const summary = analytics.getGroupSummary(context.group.id, context.group.wallet_id, 30);
+    await replyToInteraction(
+      interaction,
+      analytics.formatWalletSummaryText(summary, "Guild spend"),
       true
     );
     return;

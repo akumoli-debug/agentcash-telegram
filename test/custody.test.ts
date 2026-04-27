@@ -27,8 +27,8 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     HEALTH_HOST: "127.0.0.1",
     HEALTH_PORT: 0,
     AGENTCASH_COMMAND: "agentcash",
-    AGENTCASH_ARGS: "agentcash@latest",
-    agentcashArgs: ["agentcash@latest"],
+    AGENTCASH_ARGS: "agentcash@0.14.3",
+    agentcashArgs: ["agentcash@0.14.3"],
     AGENTCASH_TIMEOUT_MS: 5000,
     DEFAULT_SPEND_CAP_USDC: 0.5,
     HARD_SPEND_CAP_USDC: 5,
@@ -97,6 +97,7 @@ describe("custody config guards", () => {
       ALLOW_INSECURE_LOCAL_CUSTODY: "true",
       ALLOW_SQLITE_IN_PRODUCTION: "true",
       ALLOW_LOCAL_LOCKS_IN_PRODUCTION: "true",
+      AGENTCASH_ARGS: "agentcash@0.14.3",
       HARD_SPEND_CAP_USDC: "5",
       AUDIT_SINK: "file"
     });

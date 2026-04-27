@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import http from "node:http";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { getConfig, parseConfig } from "../src/config.js";
+import { assertRuntimeDatabaseAdapterImplemented } from "../src/db/DatabaseAdapter.js";
 import { decryptSecret, encryptSecret, hashTelegramId } from "../src/lib/crypto.js";
 import { startHealthServer } from "../src/healthServer.js";
 import type { AppConfig } from "../src/config.js";
@@ -24,12 +25,57 @@ const silentLogger: AppLogger = {
 describe("config", () => {
   it("parses agentcash args into an array", () => {
     process.env.TELEGRAM_BOT_TOKEN = "test-token";
-    process.env.AGENTCASH_ARGS = "@latest agentcash";
+    process.env.AGENTCASH_ARGS = "agentcash@0.14.3 --verbose";
     process.env.MASTER_ENCRYPTION_KEY = MASTER_KEY;
 
     const config = getConfig();
 
-    expect(config.agentcashArgs).toEqual(["@latest", "agentcash"]);
+    expect(config.agentcashArgs).toEqual(["agentcash@0.14.3", "--verbose"]);
+  });
+
+  it("allows development @latest with a warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const config = parseConfig({
+      NODE_ENV: "development",
+      TELEGRAM_BOT_TOKEN: "test-token",
+      AGENTCASH_ARGS: "agentcash@latest",
+      MASTER_ENCRYPTION_KEY: MASTER_KEY
+    });
+
+    expect(config.agentcashArgs).toEqual(["agentcash@latest"]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("allowed only for development"));
+    warn.mockRestore();
+  });
+
+  it("rejects @latest in production", () => {
+    expect(() =>
+      parseConfig({
+        NODE_ENV: "production",
+        TELEGRAM_BOT_TOKEN: "test-token",
+        AGENTCASH_ARGS: "agentcash@latest",
+        MASTER_ENCRYPTION_KEY: MASTER_KEY,
+        ALLOW_INSECURE_LOCAL_CUSTODY: "true",
+        ALLOW_SQLITE_IN_PRODUCTION: "true",
+        ALLOW_LOCAL_LOCKS_IN_PRODUCTION: "true",
+        HARD_SPEND_CAP_USDC: "5",
+        AUDIT_SINK: "file"
+      })
+    ).toThrow(/AGENTCASH_ARGS must pin/);
+  });
+
+  it("fails clearly when Postgres runtime adapter is selected", () => {
+    const config = parseConfig({
+      NODE_ENV: "test",
+      TELEGRAM_BOT_TOKEN: "test-token",
+      DATABASE_PROVIDER: "postgres",
+      DATABASE_URL: "postgres://example.invalid/db",
+      MASTER_ENCRYPTION_KEY: MASTER_KEY
+    });
+
+    expect(() => assertRuntimeDatabaseAdapterImplemented(config)).toThrow(
+      "Postgres runtime adapter is not implemented yet. Use SQLite for local demo or implement PostgresAdapter before production."
+    );
   });
 
   it("fails clearly when neither Telegram nor Discord bot token is set", () => {

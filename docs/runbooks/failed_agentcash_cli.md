@@ -16,7 +16,7 @@
 
 ```bash
 AGENTCASH_COMMAND=npx
-AGENTCASH_ARGS=agentcash@latest
+AGENTCASH_ARGS=agentcash@0.14.3
 corepack pnpm smoke:agentcash
 ```
 
@@ -28,7 +28,7 @@ corepack pnpm smoke:agentcash
 
 ## Recovery
 
-- Pin or repair the CLI package.
+- Pin or repair the CLI package. Never switch demos or release builds to an unpinned dist tag.
 - Run `corepack pnpm smoke:dry` then a no-funds live smoke.
 - Resume funded tests only after health passes.
 

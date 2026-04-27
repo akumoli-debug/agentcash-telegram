@@ -16,7 +16,7 @@
 ```bash
 ALLOW_HIGH_VALUE_CALLS=false
 HARD_SPEND_CAP_USDC=0.01
-docker compose up -d --build
+docker compose -f docker-compose.demo.yml up -d --build
 ```
 
 Do not simply rotate `MASTER_ENCRYPTION_KEY`; existing encrypted wallet records cannot be read without a migration plan.

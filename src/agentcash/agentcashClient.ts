@@ -38,6 +38,10 @@ export interface AgentCashFetchResult {
   txHash?: string;
 }
 
+export interface AgentCashFetchOptions {
+  idempotencyKey?: string;
+}
+
 interface WalletCommandInput {
   wallet: WalletRow;
   homeDir: string;
@@ -139,8 +143,10 @@ export class AgentCashClient {
   async fetchJson(
     wallet: WalletRow,
     url: string,
-    body?: Record<string, unknown>
+    body?: Record<string, unknown>,
+    options: AgentCashFetchOptions = {}
   ): Promise<AgentCashFetchResult> {
+    void options;
     const args = ["fetch", url];
 
     if (body) {

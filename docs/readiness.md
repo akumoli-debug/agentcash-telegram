@@ -10,6 +10,7 @@ This repo is demo-oriented and locally verifiable. It is not yet a production cu
 - Bounded quote flow before paid execution.
 - Immutable canonical request storage in `quotes`.
 - Atomic quote approval to reject replay.
+- Execution leases, `execution_unknown` status, and operator scripts for stuck paid execution review.
 - Transaction, preflight, and audit event records.
 - Health endpoints at `/healthz` and `/readyz`.
 - Startup AgentCash CLI health check, enabled by default.
@@ -27,12 +28,12 @@ These have automated coverage, but they are not final-product claims until live 
 ## Production Blockers
 
 - SQLite is local-only and has no production backup/restore workflow.
-- Postgres migrations and adapter exist, but the full repository layer is not wired to Postgres yet.
-- Redis locking exists for coordination, but lock renewal and stuck-execution reconciliation are not implemented.
+- Postgres is a migration scaffold and future production DB target only; the runtime adapter is not implemented and app startup fails if `DATABASE_PROVIDER=postgres`.
+- Redis locking exists for coordination, but lock renewal and continuous stuck-execution scheduling are not implemented.
 - `local_cli` custody is demo-only; decrypted key env passing is isolated in `LocalCliSigner` but still happens.
 - No implemented remote signer or KMS/HSM signer.
 - Local key version tracking exists, but no automatic fund migration, production key rotation, or break-glass process exists.
-- No external immutable audit log shipping.
+- File/HTTP audit shipping now runs through a DB-backed outbox, but there is no immutable log store, alerting, or retention evidence yet.
 - No multi-region or multi-replica coordination.
 - No live funded smoke record for Telegram, Discord, inline mode, webhook mode, or group wallets.
 - Health endpoints do not prove AgentCash CLI health, bot reachability, payment rails, or database durability.
@@ -124,10 +125,10 @@ Webhook:
 
 ## Production Ready Would Require
 
-- Fully wired Postgres repository adapter with migrations, backups, restore drills, and transactional tests.
-- Distributed locking with ownership tokens, expiry handling, renewal, and stuck execution reconciliation.
+- Fully wired Postgres runtime repository adapter with migrations, backups, restore drills, and transactional tests.
+- Distributed locking with ownership tokens, expiry handling, renewal, continuous stuck execution reconciliation, and upstream reconciliation support.
 - Managed key custody with a reviewed remote signer or KMS/HSM, rotation, revocation, and incident procedures.
-- External audit log shipping.
+- Immutable external audit storage with alerting, retention, and operator runbooks.
 - Live end-to-end tests or monitored smoke runs for Telegram, Discord, webhook, AgentCash quote/check/fetch, and funded execution.
 - Secrets management and deployment hardening.
 - Rate-limit, abuse, and operational monitoring.

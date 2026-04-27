@@ -56,8 +56,8 @@ DATABASE_PROVIDER=postgres DATABASE_URL=<url> corepack pnpm db:migrate
 - `local_cli` custody is demo-only.
 - The remote signer and KMS paths are interfaces/stubs, not production implementations.
 - Postgres migrations and adapter scaffolding exist, but the synchronous repository surface is not fully wired to Postgres in the live app.
-- Redis locks are implemented with ownership tokens and Lua release, but lock renewal and stuck execution reconciliation are not complete.
-- External audit sink classes exist, but full production audit shipping is not wired end to end.
+- Redis locks are implemented with ownership tokens and Lua release. Execution leases and operator reconciliation exist, but lock renewal, continuous scheduling, and upstream AgentCash reconciliation are not complete.
+- File/HTTP audit shipping is wired through a DB-backed outbox, but immutable storage, retention evidence, and alerting are not productionized.
 - Live Telegram, Discord, webhook, inline, and funded AgentCash smoke evidence must be captured per environment.
 
 ## Intentionally Not Productionized
@@ -73,7 +73,7 @@ DATABASE_PROVIDER=postgres DATABASE_URL=<url> corepack pnpm db:migrate
 ## What A Next PR Would Do
 
 1. Finish the Postgres repository adapter and run the full test suite against SQLite and Postgres.
-2. Wire the configured `AuditSink` globally so HTTP/file shipping is exercised from every audit event path.
-3. Implement stuck `executing` quote reconciliation.
+2. Add audit ship-failure alerting, retention policy, and immutable external audit storage.
+3. Implement upstream AgentCash reconciliation and continuous scheduling for the execution reconciler.
 4. Build a remote signer service and replace `local_cli` for production-like deploys.
 5. Capture dated live smoke evidence and attach it to [docs/release-checklist.md](release-checklist.md).

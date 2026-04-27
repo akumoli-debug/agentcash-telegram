@@ -11,7 +11,6 @@ Use this before tagging or presenting the repository as a v0.1 release package.
 - [ ] `.env.example` is complete and uses placeholders.
 - [ ] README status table is accurate.
 - [ ] Limitations and custody sections are accurate.
-- [ ] Demo video/GIF/Loom is recorded or explicitly left as a placeholder.
 
 ## Validation
 
@@ -21,6 +20,7 @@ Use this before tagging or presenting the repository as a v0.1 release package.
 - [ ] `corepack pnpm test` passes.
 - [ ] `corepack pnpm build` passes.
 - [ ] `corepack pnpm smoke:dry` passes.
+- [ ] `corepack pnpm validate:release` passes and writes `.release/validation.json`.
 - [ ] `corepack pnpm release:check` passes.
 
 ## Live Smoke Evidence
@@ -39,7 +39,7 @@ Use this before tagging or presenting the repository as a v0.1 release package.
 
 ## Security And Custody
 
-- [ ] README says this is not production-ready custody.
+- [ ] README says this is not production custody.
 - [ ] `CUSTODY_MODE=local_cli` is described as demo-only.
 - [ ] No production custody claim is made.
 - [ ] Runbooks are linked from README.

@@ -1,12 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppDatabase } from "../src/db/client.js";
-import { SkillExecutor, canonicalizeJson, usdcToCents } from "../src/agentcash/skillExecutor.js";
+import {
+  SkillExecutor,
+  canonicalizeJson,
+  makeUpstreamIdempotencyKey,
+  usdcToCents
+} from "../src/agentcash/skillExecutor.js";
+import { ExecutionReconciler } from "../src/workers/executionReconciler.js";
 import type { AppConfig } from "../src/config.js";
 import type { AppLogger } from "../src/lib/logger.js";
 import type { AgentCashClient } from "../src/agentcash/agentcashClient.js";
 import type { WalletManager } from "../src/wallets/walletManager.js";
 import type { UserRow, WalletRow } from "../src/db/client.js";
 import { QuoteError, SpendingCapError, InsufficientBalanceError } from "../src/lib/errors.js";
+import type { LockHandle, LockManager } from "../src/lib/lockManager.js";
 
 const MASTER_KEY = Buffer.alloc(32, 42).toString("base64");
 
@@ -20,8 +27,8 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     WEBHOOK_HOST: "0.0.0.0",
     WEBHOOK_PORT: 3000,
     AGENTCASH_COMMAND: "agentcash",
-    AGENTCASH_ARGS: "agentcash@latest",
-    agentcashArgs: ["agentcash@latest"],
+    AGENTCASH_ARGS: "agentcash@0.14.3",
+    agentcashArgs: ["agentcash@0.14.3"],
     AGENTCASH_TIMEOUT_MS: 5000,
     DEFAULT_SPEND_CAP_USDC: 0.5,
     HARD_SPEND_CAP_USDC: 5,
@@ -49,6 +56,30 @@ const silentLogger: AppLogger = {
   fatal: () => {},
   child: () => silentLogger
 } as unknown as AppLogger;
+
+class FailingReleaseLockManager implements LockManager {
+  private releaseCount = 0;
+
+  async acquire(key: string, _ttlMs: number): Promise<LockHandle> {
+    return { key, token: "test-token" };
+  }
+
+  async release(_handle: LockHandle): Promise<void> {
+    this.releaseCount += 1;
+    if (this.releaseCount >= 2) {
+      throw new Error("release failed");
+    }
+  }
+
+  async withLock<T>(key: string, _ttlMs: number, fn: () => Promise<T>): Promise<T> {
+    const handle = await this.acquire(key, _ttlMs);
+    try {
+      return await fn();
+    } finally {
+      await this.release(handle);
+    }
+  }
+}
 
 function makeWalletRow(overrides: Partial<WalletRow> = {}): WalletRow {
   return {
@@ -368,6 +399,185 @@ describe("Phase 5 - Concurrent confirm clicks only execute once", () => {
   });
 });
 
+describe("Execution reconciliation", () => {
+  let db: AppDatabase;
+
+  beforeEach(() => {
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    db.sqlite.exec("INSERT INTO users (id, telegram_user_id, cap_enabled, default_spend_cap_usdc, created_at, updated_at) VALUES ('usr_test', '12345', 1, 0.5, datetime('now'), datetime('now'))");
+    db.sqlite.exec("INSERT INTO wallets (id, kind, owner_user_id, home_dir_hash, address, network, encrypted_private_key, status, created_at, updated_at) VALUES ('wal_test', 'user', 'usr_test', 'testhash', '0xABC', 'base', 'v1.iv.tag.ct', 'active', datetime('now'), datetime('now'))");
+  });
+
+  afterEach(() => db.close());
+
+  function createApprovedQuote() {
+    const quote = db.createQuote({
+      userHash: "user-hash",
+      walletId: "wal_test",
+      skill: "research",
+      endpoint: "https://example.test",
+      canonicalRequestJson: "{}",
+      requestHash: "request-hash",
+      quotedCostCents: 1,
+      maxApprovedCostCents: 50,
+      isDevUnquoted: false,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      requesterUserId: "usr_test"
+    });
+    expect(db.atomicApproveQuote(quote.id)).toBe(true);
+    return quote;
+  }
+
+  it("crash simulation leaves an executing quote with lease metadata", () => {
+    const quote = createApprovedQuote();
+    const upstreamIdempotencyKey = makeUpstreamIdempotencyKey({
+      quoteId: quote.id,
+      walletId: quote.wallet_id,
+      requestHash: quote.request_hash
+    });
+
+    expect(
+      db.atomicBeginQuoteExecution(quote.id, {
+        leaseExpiresAt: new Date(Date.now() - 1000).toISOString(),
+        upstreamIdempotencyKey
+      })
+    ).toBe(true);
+
+    const executing = db.getQuote(quote.id)!;
+    expect(executing.status).toBe("executing");
+    expect(executing.execution_started_at).toBeTruthy();
+    expect(executing.execution_lease_expires_at).toBeTruthy();
+    expect(executing.execution_attempt_count).toBe(1);
+    expect(executing.upstream_idempotency_key).toBe(upstreamIdempotencyKey);
+  });
+
+  it("reconciler marks expired executing quote as execution_unknown without retrying", () => {
+    const quote = createApprovedQuote();
+    expect(
+      db.atomicBeginQuoteExecution(quote.id, {
+        leaseExpiresAt: new Date(Date.now() - 1000).toISOString(),
+        upstreamIdempotencyKey: "upstream-key"
+      })
+    ).toBe(true);
+
+    const reconciler = new ExecutionReconciler(db, silentLogger);
+    const result = reconciler.runOnce();
+
+    expect(result).toMatchObject({ inspected: 1, markedUnknown: 1, markedSucceeded: 0 });
+    const reconciled = db.getQuote(quote.id)!;
+    expect(reconciled.status).toBe("execution_unknown");
+    expect(reconciled.reconciliation_status).toBe("operator_review_required");
+    expect(db.sqlite.prepare("SELECT * FROM transactions").all()).toHaveLength(0);
+  });
+
+  it("transaction exists so reconciler marks expired executing quote succeeded", () => {
+    const quote = createApprovedQuote();
+    expect(
+      db.atomicBeginQuoteExecution(quote.id, {
+        leaseExpiresAt: new Date(Date.now() - 1000).toISOString(),
+        upstreamIdempotencyKey: "upstream-key"
+      })
+    ).toBe(true);
+    const transaction = db.createTransaction({
+      userId: "usr_test",
+      walletId: "wal_test",
+      telegramChatId: "user-hash",
+      telegramIdHash: "user-hash",
+      commandName: "research",
+      skill: "research",
+      endpoint: "https://example.test",
+      quoteId: quote.id,
+      status: "success",
+      idempotencyKey: "upstream-key",
+      requestHash: quote.request_hash
+    }) as { id: string };
+
+    const reconciler = new ExecutionReconciler(db, silentLogger);
+    const result = reconciler.runOnce();
+
+    expect(result).toMatchObject({ inspected: 1, markedSucceeded: 1, markedUnknown: 0 });
+    const reconciled = db.getQuote(quote.id)!;
+    expect(reconciled.status).toBe("succeeded");
+    expect(reconciled.transaction_id).toBe(transaction.id);
+  });
+
+  it("ambiguous fetch failure is marked execution_unknown and is not retried automatically", async () => {
+    const fetchJson = vi.fn().mockRejectedValue(new Error("network lost after submit"));
+    const executor = makeExecutor(db, makeConfig(), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} }),
+      fetchJson
+    });
+
+    const result = await executor.execute("research", "x402 protocol", baseContext);
+    if (result.type !== "confirmation_required") throw new Error("expected confirmation");
+
+    await expect(executor.executeApprovedQuote(result.quoteId, baseContext)).rejects.toThrow(
+      /network lost/
+    );
+
+    const quote = db.getQuote(result.quoteId)!;
+    expect(quote.status).toBe("execution_unknown");
+    expect(quote.last_execution_error).toContain("operator reconciliation required");
+    expect(fetchJson).toHaveBeenCalledTimes(1);
+    expect(db.sqlite.prepare("SELECT * FROM transactions").all()).toHaveLength(0);
+  });
+
+  it("passes deterministic upstream idempotency key to AgentCashClient boundary", async () => {
+    const fetchJson = vi.fn().mockResolvedValue({ raw: {}, data: {}, actualCostCents: 1 });
+    const executor = makeExecutor(db, makeConfig(), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} }),
+      fetchJson
+    });
+
+    const result = await executor.execute("research", "x402 protocol", baseContext);
+    if (result.type !== "confirmation_required") throw new Error("expected confirmation");
+
+    await executor.executeApprovedQuote(result.quoteId, baseContext);
+
+    const quote = db.getQuote(result.quoteId)!;
+    const expectedKey = makeUpstreamIdempotencyKey({
+      quoteId: quote.id,
+      walletId: quote.wallet_id,
+      requestHash: quote.request_hash
+    });
+    expect(quote.upstream_idempotency_key).toBe(expectedKey);
+    expect(fetchJson).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.any(Object),
+      { idempotencyKey: expectedKey }
+    );
+  });
+
+  it("release lock failure after success does not mark execution failed", async () => {
+    const user = makeUserRow();
+    const wallet = makeWalletRow();
+    const ac = makeAgentCashClient({
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} }),
+      fetchJson: vi.fn().mockResolvedValue({ raw: {}, data: {}, actualCostCents: 1 })
+    });
+    const wm = makeWalletManager(user, wallet);
+    const executor = new SkillExecutor(
+      db,
+      wm,
+      ac,
+      silentLogger,
+      makeConfig(),
+      new FailingReleaseLockManager()
+    );
+
+    const result = await executor.execute("research", "x402 protocol", baseContext);
+    if (result.type !== "confirmation_required") throw new Error("expected confirmation");
+
+    await expect(executor.executeApprovedQuote(result.quoteId, baseContext)).rejects.toThrow(/release failed/);
+
+    const quote = db.getQuote(result.quoteId)!;
+    expect(quote.status).toBe("succeeded");
+    expect(quote.transaction_id).toBeTruthy();
+  });
+});
+
 describe("Phase 5 - Concurrent /start creates one wallet", () => {
   let db: AppDatabase;
 
@@ -499,7 +709,7 @@ describe("Phase 4 - Cap exceeded logging", () => {
     expect(quote.quoted_cost_cents).toBe(25);
   });
 
-  it("denies a quote above the user per-call cap before the hard cap", async () => {
+  it("requires confirmation above the user per-call cap before the hard cap", async () => {
     const executor = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
       checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 75, raw: {} }),
       getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
@@ -508,14 +718,9 @@ describe("Phase 4 - Cap exceeded logging", () => {
     });
 
     await expect(executor.execute("research", "x402 protocol", baseContext))
-      .rejects.toThrow(/exceeds_user_cap/);
+      .resolves.toMatchObject({ type: "confirmation_required" });
 
-    const preflight = db.sqlite.prepare("SELECT * FROM preflight_attempts ORDER BY id DESC LIMIT 1").get() as {
-      error_code: string;
-      failure_stage: string;
-    };
-    expect(preflight.failure_stage).toBe("cap");
-    expect(preflight.error_code).toBe("exceeds_user_cap");
+    expect(db.sqlite.prepare("SELECT * FROM preflight_attempts").all()).toHaveLength(0);
   });
 
   it("checks cents at the user cap boundary", async () => {
@@ -540,15 +745,16 @@ describe("Phase 4 - Cap exceeded logging", () => {
     db.sqlite.exec("INSERT INTO users (id, telegram_user_id, cap_enabled, default_spend_cap_usdc, created_at, updated_at) VALUES ('usr_test', '12345', 1, 0.5, datetime('now'), datetime('now'))");
     db.sqlite.exec("INSERT INTO wallets (id, kind, owner_user_id, home_dir_hash, address, network, encrypted_private_key, status, created_at, updated_at) VALUES ('wal_test', 'user', 'usr_test', 'testhash', '0xABC', 'base', 'v1.iv.tag.ct', 'active', datetime('now'), datetime('now'))");
 
-    const denied = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+    const requiresConfirmation = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
       checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 51, raw: {} }),
       getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
     }, {
       getConfirmationCap: vi.fn().mockReturnValue(0.5)
     });
 
-    await expect(denied.execute("research", "x402 protocol", baseContext))
-      .rejects.toThrow(/exceeds_user_cap/);
+    await expect(requiresConfirmation.execute("research", "x402 protocol", baseContext)).resolves.toMatchObject({
+      type: "confirmation_required"
+    });
   });
 
   it("denies a quote above wallet balance when the user cap allows it", async () => {
@@ -579,7 +785,7 @@ describe("Phase 4 - Cap exceeded logging", () => {
     });
 
     await expect(executor.execute("research", "x402 protocol", baseContext))
-      .rejects.toThrow(/exceeds_hard_cap/);
+      .rejects.toThrow(/hard safety cap/);
 
     const preflight = db.sqlite.prepare("SELECT * FROM preflight_attempts ORDER BY id DESC LIMIT 1").get() as {
       error_code: string;

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import crypto from "node:crypto";
 import type { AppConfig } from "../config.js";
 import { AppDatabase, type GroupRow, type UserRow, type WalletRow } from "../db/client.js";
 import { hashSensitiveValue, hashTelegramId } from "../lib/crypto.js";
@@ -13,6 +14,7 @@ import { defaultLockManager, type LockManager } from "../lib/lockManager.js";
 import type { AppLogger } from "../lib/logger.js";
 import { WalletManager, type TelegramProfile } from "../wallets/walletManager.js";
 import { AgentCashClient, type AgentCashFetchResult } from "./agentcashClient.js";
+import { PolicyEngine } from "../policy/PolicyEngine.js";
 
 export type SkillName = "research" | "enrich" | "generate";
 
@@ -159,16 +161,33 @@ const skillDefinitions: Record<SkillName, SkillDefinition<string>> = {
 const EXECUTION_LOCK_TTL_MS = 120_000;
 const QUOTE_MISSING_MESSAGE = "quote_missing: I could not get a reliable price quote, so I blocked execution.";
 const QUOTE_INVALID_MESSAGE = "quote_invalid: I could not get a reliable price quote, so I blocked execution.";
+const EXECUTION_LEASE_TTL_MS = 120_000;
+
+export function makeUpstreamIdempotencyKey(input: {
+  quoteId: string;
+  walletId: string;
+  requestHash: string;
+}): string {
+  return `agentcash:${crypto
+    .createHash("sha256")
+    .update(`${input.quoteId}:${input.walletId}:${input.requestHash}`)
+    .digest("hex")}`;
+}
 
 export class SkillExecutor {
+  private readonly policyEngine: PolicyEngine;
+
   constructor(
     private readonly db: AppDatabase,
     private readonly walletManager: WalletManager,
     private readonly agentcashClient: AgentCashClient,
     private readonly logger: AppLogger,
     private readonly config: AppConfig,
-    private readonly lockManager: LockManager = defaultLockManager
-  ) {}
+    private readonly lockManager: LockManager = defaultLockManager,
+    policyEngine?: PolicyEngine
+  ) {
+    this.policyEngine = policyEngine ?? new PolicyEngine(db, config);
+  }
 
   getSkillDefinition(name: SkillName): SkillDefinition<string> {
     return skillDefinitions[name];
@@ -206,38 +225,42 @@ export class SkillExecutor {
         userHash,
         requestHash
       );
-      this.assertGroupDailyCap(group, quotedCostCents, userHash, wallet.id, skill.name, requestHash);
-
-      const hardCapCents = usdcToCents(this.config.HARD_SPEND_CAP_USDC);
-
-      if (!this.config.ALLOW_HIGH_VALUE_CALLS && quotedCostCents > hardCapCents) {
-        this.db.logPreflightAttempt({
-          userHash,
-          walletId: wallet.id,
-          skill: skill.name,
-          endpoint: skill.endpoint,
-          requestHash,
-          failureStage: "cap",
-          errorCode: "exceeds_hard_cap",
-          safeErrorMessage: "Request exceeds hard MVP safety cap"
-        });
-        throw new SpendingCapError(
-          `exceeds_hard_cap: This request is estimated at ${formatUsdCents(quotedCostCents)}, ` +
-          `above the hard MVP safety cap of ${formatUsdCents(hardCapCents)}.`,
-          {
-            guard: "exceeds_hard_cap",
-            quotedCostCents,
-            hardCapCents
-          }
-        );
-      }
 
       const confirmationCap = group
         ? this.walletManager.getGroupConfirmationCap(group)
         : this.walletManager.getConfirmationCap(user);
-      const userCapCents = !group && confirmationCap !== undefined ? usdcToCents(confirmationCap) : undefined;
+      const groupAdminCap = group ? (group.spend_cap_usdc ?? this.config.DEFAULT_SPEND_CAP_USDC) : undefined;
 
-      if (userCapCents !== undefined && quotedCostCents > userCapCents) {
+      const policyDecision = this.policyEngine.evaluate({
+        platform: context.telegramId.startsWith("discord:") ? "discord" : "telegram",
+        actorIdHash: userHash,
+        walletId: wallet.id,
+        walletStatus: wallet.status,
+        groupId: group?.id ?? null,
+        skill: skill.name,
+        endpoint: skill.endpoint,
+        quotedCostCents,
+        isDevUnquoted,
+        confirmationCapUsdc: confirmationCap,
+        groupAdminCapUsdc: groupAdminCap
+      });
+
+      const isDenyOutcome =
+        policyDecision.outcome === "deny_frozen" ||
+        policyDecision.outcome === "deny_daily_cap" ||
+        policyDecision.outcome === "deny_weekly_cap" ||
+        policyDecision.outcome === "deny_skill_blocked" ||
+        policyDecision.outcome === "deny_platform" ||
+        policyDecision.outcome === "deny_hard_cap";
+
+      if (isDenyOutcome) {
+        const errorCode =
+          policyDecision.outcome === "deny_frozen" ? "WALLET_FROZEN"
+          : policyDecision.outcome === "deny_daily_cap" ? "DAILY_CAP_EXCEEDED"
+          : policyDecision.outcome === "deny_weekly_cap" ? "WEEKLY_CAP_EXCEEDED"
+          : policyDecision.outcome === "deny_skill_blocked" ? "SKILL_BLOCKED"
+          : policyDecision.outcome === "deny_hard_cap" ? "exceeds_hard_cap"
+          : "PLATFORM_DENIED";
         this.db.logPreflightAttempt({
           userHash,
           walletId: wallet.id,
@@ -245,18 +268,19 @@ export class SkillExecutor {
           endpoint: skill.endpoint,
           requestHash,
           failureStage: "cap",
-          errorCode: "exceeds_user_cap",
-          safeErrorMessage: "Request exceeds user per-call cap"
+          errorCode,
+          safeErrorMessage: policyDecision.reason
         });
-        throw new SpendingCapError(
-          `exceeds_user_cap: This request is estimated at ${formatUsdCents(quotedCostCents)}, ` +
-          `above your per-call cap of ${formatUsdCents(userCapCents)}.`,
-          {
-            guard: "exceeds_user_cap",
-            quotedCostCents,
-            userCapCents
-          }
-        );
+        if (policyDecision.outcome === "deny_frozen") {
+          throw new ValidationError("This wallet is frozen. Balance, deposit, and history still work.");
+        }
+        if (policyDecision.outcome === "deny_skill_blocked" || policyDecision.outcome === "deny_platform") {
+          throw new ValidationError(policyDecision.reason);
+        }
+        throw new SpendingCapError(policyDecision.reason, {
+          quotedCostCents,
+          hardCapCents: Math.round(this.config.HARD_SPEND_CAP_USDC * 100)
+        });
       }
 
       const balanceCents = usdcBalanceToCents(balance.usdcBalance);
@@ -283,15 +307,13 @@ export class SkillExecutor {
         );
       }
 
+      const hardCapCents = Math.round(this.config.HARD_SPEND_CAP_USDC * 100);
       const maxApprovedCostCents = Math.min(Math.max(quotedCostCents * 2, quotedCostCents + 10), hardCapCents);
       const expiresAt = new Date(
         Date.now() + this.config.PENDING_CONFIRMATION_TTL_SECONDS * 1000
       ).toISOString();
 
-      const requiresGroupAdminApproval =
-        Boolean(group) &&
-        confirmationCap !== undefined &&
-        quotedCostCents > usdcToCents(confirmationCap);
+      const requiresGroupAdminApproval = policyDecision.requiresGroupAdminApproval;
 
       const quote = this.db.createQuote({
         userHash,
@@ -312,16 +334,23 @@ export class SkillExecutor {
         walletScope: group ? (group.platform === "discord" ? "discord_guild" : "telegram_group") : "user"
       });
 
+      this.db.recordPolicyDecision(quote.id, wallet.id, userHash, policyDecision);
+
       const needsConfirmation =
         context.forceConfirmation ||
-        (Boolean(group) && confirmationCap !== undefined && quotedCostCents > usdcToCents(confirmationCap));
+        policyDecision.outcome === "require_confirmation" ||
+        policyDecision.outcome === "require_group_admin_approval";
 
       if (needsConfirmation) {
         const costLine = isDevUnquoted
           ? `This ${skill.name} call may incur a charge (dev mode: price unknown).`
           : `This ${skill.name} call is quoted at ${formatUsdCents(quotedCostCents)}.`;
         const capLine =
-          confirmationCap !== undefined
+          policyDecision.policyType === "first_spend"
+            ? "This is the first spend from this wallet."
+            : policyDecision.policyType === "high_cost"
+            ? policyDecision.reason
+            : confirmationCap !== undefined
             ? group
               ? `This group's per-call cap is ${formatUsdCents(usdcToCents(confirmationCap))}.`
               : `Your per-call cap is ${formatUsdCents(usdcToCents(confirmationCap))}.`
@@ -706,7 +735,16 @@ export class SkillExecutor {
       this.config.RATE_LIMIT_PAID_EXECUTION_MAX_PER_MINUTE
     );
 
-    if (!this.db.atomicBeginQuoteExecution(quoteId)) {
+    const upstreamIdempotencyKey =
+      quote.upstream_idempotency_key ??
+      makeUpstreamIdempotencyKey({
+        quoteId,
+        walletId: wallet.id,
+        requestHash: quote.request_hash
+      });
+    const leaseExpiresAt = new Date(Date.now() + EXECUTION_LEASE_TTL_MS).toISOString();
+
+    if (!this.db.atomicBeginQuoteExecution(quoteId, { leaseExpiresAt, upstreamIdempotencyKey })) {
       this.db.logPreflightAttempt({
         userHash,
         walletId: wallet.id,
@@ -720,25 +758,10 @@ export class SkillExecutor {
       throw new QuoteError("This confirmation was already used.");
     }
 
-    const transaction = this.db.createTransaction({
-      userId: requesterUserId,
-      walletId: wallet.id,
-      groupId: quote.group_id ?? null,
-      telegramChatId: userHash,
-      telegramIdHash: userHash,
-      commandName: skill.name,
-      skill: skill.name,
-      endpoint: skill.endpoint,
-      quoteId,
-      idempotencyKey: `quote:${quoteId}:execute`,
-      status: "submitted",
-      estimatedCostCents: quote.quoted_cost_cents,
-      quotedPriceUsdc: Number((quote.quoted_cost_cents / 100).toFixed(6)),
-      requestHash: quote.request_hash
-    }) as { id: string };
-
     try {
-      const fetchResult = await this.agentcashClient.fetchJson(wallet, skill.endpoint, requestBody);
+      const fetchResult = await this.agentcashClient.fetchJson(wallet, skill.endpoint, requestBody, {
+        idempotencyKey: upstreamIdempotencyKey
+      });
       const responseHash = hashSensitiveValue(
         JSON.stringify(fetchResult.data),
         this.config.MASTER_ENCRYPTION_KEY
@@ -748,12 +771,29 @@ export class SkillExecutor {
         wallet
       });
 
-      this.db.updateTransaction(transaction.id, {
+      const transaction = this.db.createTransaction({
+        userId: requesterUserId,
+        walletId: wallet.id,
+        groupId: quote.group_id ?? null,
+        telegramChatId: userHash,
+        telegramIdHash: userHash,
+        commandName: skill.name,
+        skill: skill.name,
+        endpoint: skill.endpoint,
+        quoteId,
+        idempotencyKey: upstreamIdempotencyKey,
         status: "success",
+        estimatedCostCents: quote.quoted_cost_cents,
+        quotedPriceUsdc: Number((quote.quoted_cost_cents / 100).toFixed(6)),
         actualCostCents: fetchResult.actualCostCents ?? null,
+        actualPriceUsdc:
+          fetchResult.actualCostCents === undefined
+            ? null
+            : Number((fetchResult.actualCostCents / 100).toFixed(6)),
+        requestHash: quote.request_hash,
         responseHash,
         txHash: fetchResult.txHash ?? null
-      });
+      }) as { id: string };
 
       this.db.transitionQuoteStatus(quoteId, "executing", "succeeded", {
         executedAt: new Date().toISOString(),
@@ -787,18 +827,11 @@ export class SkillExecutor {
         error instanceof Error
           ? hashSensitiveValue(error.message, this.config.MASTER_ENCRYPTION_KEY)
           : undefined;
+      const safeError = safeExecutionErrorMessage(error);
 
-      this.db.updateTransaction(transaction.id, {
-        status: "error",
-        responseHash,
-        errorCode:
-          error instanceof Error && "code" in error
-            ? String((error as { code?: string }).code ?? "UNKNOWN")
-            : "UNKNOWN",
-        errorMessage: error instanceof Error ? error.message : "Unknown error"
+      this.db.transitionQuoteStatus(quoteId, "executing", "execution_unknown", {
+        lastExecutionError: safeError
       });
-
-      this.db.transitionQuoteStatus(quoteId, "executing", "failed");
 
       this.logger.warn(
         {
@@ -809,9 +842,10 @@ export class SkillExecutor {
           requestHash: quote.request_hash,
           responseHash,
           quotedCostCents: quote.quoted_cost_cents,
-          status: "error"
+          upstreamIdempotencyKey,
+          status: "execution_unknown"
         },
-        "skill execution failed"
+        "skill execution became ambiguous and requires reconciliation"
       );
 
       this.db.logPreflightAttempt({
@@ -825,7 +859,7 @@ export class SkillExecutor {
           error instanceof Error && "code" in error
             ? String((error as { code?: string }).code ?? "EXEC_ERROR")
             : "EXEC_ERROR",
-        safeErrorMessage: "Skill execution failed after approval"
+        safeErrorMessage: safeError
       });
 
       throw error instanceof Error
@@ -853,38 +887,15 @@ export class SkillExecutor {
     }
   }
 
-  private assertGroupDailyCap(
-    group: GroupRow | undefined,
-    quotedCostCents: number,
-    userHash: string,
-    walletId: string,
-    skillName: string,
-    requestHash: string
-  ): void {
-    if (!group) {
-      return;
-    }
+}
 
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const spent = this.db.getDailySpendCentsForGroup(group.id, since);
-    const limit = Math.round((this.config.GROUP_DAILY_CAP_USDC ?? 25) * 100);
-
-    if (spent + quotedCostCents <= limit) {
-      return;
-    }
-
-    this.db.logPreflightAttempt({
-      userHash,
-      walletId,
-      skill: skillName,
-      requestHash,
-      failureStage: "cap",
-      errorCode: "GROUP_DAILY_CAP_EXCEEDED",
-      safeErrorMessage: "Group daily cap exceeded"
-    });
-
-    throw new SpendingCapError("This group wallet has reached its daily spend cap.");
-  }
+function safeExecutionErrorMessage(error: unknown): string {
+  const code =
+    error instanceof Error && "code" in error
+      ? String((error as { code?: string }).code ?? "UNKNOWN")
+      : "UNKNOWN";
+  const name = error instanceof Error ? error.name : "UnknownError";
+  return `Execution outcome is unknown after upstream call started; operator reconciliation required (${name}:${code}).`;
 }
 
 /**

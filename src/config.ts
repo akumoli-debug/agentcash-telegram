@@ -6,6 +6,8 @@ import { validateProductionConfig } from "./configValidation.js";
 
 loadDotEnv();
 
+export const TESTED_AGENTCASH_PACKAGE = "agentcash@0.14.3";
+
 const optionalString = z.preprocess(
   value => (typeof value === "string" && value.trim() === "" ? undefined : value),
   z.string().trim().optional()
@@ -36,6 +38,10 @@ const envSchema = z
       .default("false")
       .transform(value => value === true || value === "true"),
     AUDIT_SINK: z.enum(["database", "file", "http"]).default("database"),
+    AUDIT_STRICT_MODE: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
     AUDIT_FILE_PATH: z.string().default(".data/audit-events.jsonl"),
     AUDIT_HTTP_ENDPOINT: optionalUrl,
     ALLOW_DATABASE_AUDIT_IN_PRODUCTION: z
@@ -57,7 +63,7 @@ const envSchema = z
     HEALTH_HOST: z.string().default("0.0.0.0"),
     HEALTH_PORT: z.coerce.number().int().min(0).default(3001),
     AGENTCASH_COMMAND: z.string().default("npx"),
-    AGENTCASH_ARGS: z.string().default("agentcash@latest"),
+    AGENTCASH_ARGS: z.string().default(TESTED_AGENTCASH_PACKAGE),
     AGENTCASH_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
     DEFAULT_SPEND_CAP_USDC: z.coerce.number().positive().default(0.5),
     HARD_SPEND_CAP_USDC: z.coerce.number().positive().default(5),
@@ -82,6 +88,44 @@ const envSchema = z
       .transform(value => value === true || value === "true"),
     REMOTE_SIGNER_URL: optionalUrl,
     PENDING_CONFIRMATION_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+    // Gateway security: allowlists, pairing, group-mention requirements.
+    // Raw platform user IDs (comma-separated). Hashed at startup using the master key.
+    GATEWAY_ALLOWED_USERS: z.string().default(""),
+    TELEGRAM_ALLOWED_USERS: z.string().default(""),
+    DISCORD_ALLOWED_USERS: z.string().default(""),
+    GATEWAY_ALLOW_ALL_USERS: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
+    PAIRING_MODE: z.enum(["disabled", "dm_code"]).default("disabled"),
+    PAIRING_CODE_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+    // When true, plain group text messages require a bot @mention before routing.
+    TELEGRAM_GROUP_REQUIRE_MENTION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("true")
+      .transform(value => value === true || value === "true"),
+    // Slash commands always pass. Natural language in guilds requires @mention by default.
+    DISCORD_GUILD_REQUIRE_MENTION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("true")
+      .transform(value => value === true || value === "true"),
+    // Comma-separated hashed chat IDs that bypass the require-mention rule.
+    GROUP_FREE_RESPONSE_CHAT_IDS: z.string().default(""),
+    // Payment policy engine: per-wallet caps, trusted skills, first-spend confirmation.
+    // Daily and weekly caps are per-wallet (users). Group daily cap uses GROUP_DAILY_CAP_USDC.
+    POLICY_DAILY_CAP_USDC: z.optional(z.coerce.number().positive()),
+    POLICY_WEEKLY_CAP_USDC: z.optional(z.coerce.number().positive()),
+    // Above this threshold a confirmation is always required (independent of per-call cap).
+    POLICY_HIGH_COST_THRESHOLD_USDC: z.optional(z.coerce.number().positive()),
+    // Comma-separated skill names that are auto-approved without confirmation when cost is low.
+    POLICY_TRUSTED_SKILLS: z.string().default(""),
+    // Maximum cost in USDC for a trusted-skill auto-approval to fire.
+    POLICY_TRUSTED_AUTO_APPROVE_MAX_USDC: z.coerce.number().positive().default(0.01),
+    // Require confirmation for the very first spend from a wallet (default false to preserve existing behavior).
+    POLICY_FIRST_SPEND_REQUIRE_CONFIRMATION: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("false")
+      .transform(value => value === true || value === "true"),
     RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().int().positive().default(30),
     RATE_LIMIT_MAX_PER_HOUR: z.coerce.number().int().positive().default(100),
     RATE_LIMIT_QUOTE_MAX_PER_MINUTE: z.coerce.number().int().positive().default(8),
@@ -188,6 +232,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
   const values = parsed.data;
   validateParsedProductionConfig(values, env);
+  warnOnLatestAgentCashInDevelopment(values);
 
   return {
     ...values,
@@ -213,6 +258,16 @@ function validateParsedProductionConfig(values: z.infer<typeof envSchema>, env: 
       fieldErrors: Object.fromEntries(issues.map(issue => [issue.path.join("."), [issue.message]]))
     });
   }
+}
+
+function warnOnLatestAgentCashInDevelopment(values: z.infer<typeof envSchema>): void {
+  if (values.NODE_ENV !== "development" || !values.AGENTCASH_ARGS.includes("@latest")) {
+    return;
+  }
+
+  console.warn(
+    "AGENTCASH_ARGS contains @latest. This is allowed only for development experiments; pin a tested AgentCash CLI version before demo or release."
+  );
 }
 
 export function getConfig(): AppConfig {

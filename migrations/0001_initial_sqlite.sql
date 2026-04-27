@@ -89,12 +89,19 @@ CREATE TABLE IF NOT EXISTS quotes (
   quoted_cost_cents INTEGER NOT NULL,
   max_approved_cost_cents INTEGER NOT NULL,
   is_dev_unquoted INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','executing','succeeded','expired','canceled','failed')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','executing','succeeded','expired','canceled','failed','execution_unknown')),
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   approved_at TEXT,
   executed_at TEXT,
   transaction_id TEXT,
+  execution_started_at TEXT,
+  execution_lease_expires_at TEXT,
+  execution_attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_execution_error TEXT,
+  upstream_idempotency_key TEXT,
+  reconciliation_status TEXT,
+  reconciled_at TEXT,
   requester_user_id TEXT,
   group_id TEXT,
   requires_group_admin_approval INTEGER NOT NULL DEFAULT 0,
@@ -105,6 +112,7 @@ CREATE TABLE IF NOT EXISTS quotes (
 
 CREATE INDEX IF NOT EXISTS quotes_user_hash_created_at_idx ON quotes(user_hash, created_at DESC);
 CREATE INDEX IF NOT EXISTS quotes_status_expires_at_idx ON quotes(status, expires_at);
+CREATE INDEX IF NOT EXISTS quotes_execution_reconciliation_idx ON quotes(status, execution_lease_expires_at);
 
 CREATE TABLE IF NOT EXISTS transactions (
   id TEXT PRIMARY KEY,
@@ -178,11 +186,16 @@ CREATE TABLE IF NOT EXISTS audit_events (
   group_id TEXT,
   status TEXT,
   metadata_json TEXT,
+  shipped_at TEXT,
+  ship_attempts INTEGER NOT NULL DEFAULT 0,
+  last_ship_error TEXT,
+  sink_name TEXT,
   created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS audit_events_name_created_at_idx ON audit_events(event_name, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_quote_idx ON audit_events(quote_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_events_unshipped_idx ON audit_events(shipped_at, created_at ASC);
 
 CREATE TABLE IF NOT EXISTS inline_payloads (
   id TEXT PRIMARY KEY,

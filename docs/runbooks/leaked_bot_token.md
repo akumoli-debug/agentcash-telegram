@@ -18,7 +18,7 @@
 TELEGRAM_BOT_TOKEN=<new-token>
 DISCORD_BOT_TOKEN=<new-token>
 corepack pnpm db:migrate
-docker compose up -d --build
+docker compose -f docker-compose.demo.yml up -d --build
 ```
 
 For Telegram, reset the webhook after rotation.

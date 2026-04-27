@@ -15,10 +15,10 @@ The most stable integration surface across the Merit repos is the AgentCash CLI 
 
 Useful CLI patterns:
 
-- `npx agentcash@latest accounts`
-- `npx agentcash@latest balance`
-- `npx agentcash@latest check <endpoint>`
-- `npx agentcash@latest fetch <endpoint>`
+- `npx agentcash@0.14.3 accounts`
+- `npx agentcash@0.14.3 balance`
+- `npx agentcash@0.14.3 check <endpoint>`
+- `npx agentcash@0.14.3 fetch <endpoint>`
 
 That matches the implementation here: the bot shells out to AgentCash in isolated per-user homes and keeps payment control at the app layer.
 
