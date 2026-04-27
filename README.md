@@ -22,7 +22,7 @@ Use [docs/demo-script.md](docs/demo-script.md) for exact talk tracks and command
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| Telegram private wallets | stable MVP | `/start`, `/deposit`, `/balance`, `/cap`, `/research`, `/enrich`, `/generate`, `/history`, `/freeze`, `/unfreeze`, and `/status` are implemented and covered by automated tests around wallet provisioning, quote records, caps, confirmations, history, freeze behavior, and replay rejection. |
+| Telegram private wallets | stable MVP | `/start`, `/deposit`, `/balance`, `/cap`, `/research`, `/enrich`, `/generate`, `/history`, `/freeze`, `/unfreeze`, and `/status` are implemented and covered by automated tests around wallet provisioning, quote records, caps, confirmations, history, freeze behavior, privacy guards, and replay rejection. Private wallet commands are private-chat only. |
 | Quote-first paid execution | stable MVP | Paid calls create quote records, store canonical request data, require confirmation when needed, and use SQL status transitions plus transaction idempotency keys to avoid duplicate execution. |
 | Local SQLite development | stable local path | Schema initialization, migrations, and tests run against SQLite. SQLite is not presented as production storage. |
 | Health endpoints | implemented and tested | `/healthz` reports process liveness. `/readyz` checks DB, lock provider, custody/signer health, and platform config. `/metrics` exposes simple process metrics. |
@@ -33,7 +33,7 @@ Use [docs/demo-script.md](docs/demo-script.md) for exact talk tracks and command
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Telegram group wallets | experimental, Telegram-admin-gated | `/groupwallet create`, `sync-admins`, `roles`, `balance`, `deposit`, `history`, and `cap` are implemented. Creation and admin actions require fresh Telegram creator/administrator verification. Not yet live-smoked in a real group with admin changes. |
+| Telegram group wallets | experimental, Telegram-admin-gated | `/groupwallet create`, `sync-admins`, `roles`, `balance`, `deposit`, `history`, and `cap` are implemented. Groups use `/groupwallet` only; private-wallet deposit, balance, history, and paid user-wallet commands are refused in groups with a DM instruction. Creation and admin actions require fresh Telegram creator/administrator verification. Not yet live-smoked in a real group with admin changes. |
 | Telegram inline mode | experimental preview-first | Inline results are previews only; paid execution requires opening the result and confirming. Requires separate BotFather inline setup and live smoke. |
 | Discord DM wallets | experimental | `/ac wallet ...` supports private balance, deposit, cap, history, research, freeze, unfreeze, and status. Details are ephemeral by default. Needs live Discord smoke. |
 | Discord guild wallets | experimental | `/ac guild ...` supports create, balance, deposit, cap, history, sync-admins, research, freeze, unfreeze, and status. Admin actions require Discord Manage Server or Administrator. Needs live guild smoke and more operational review. |
@@ -101,7 +101,7 @@ More diagrams:
 | Platform | Wallet scope | Status | Admin model | Privacy defaults |
 | --- | --- | --- | --- | --- |
 | Telegram private chat | user wallet | stable MVP | wallet owner only | wallet details sent in private chat |
-| Telegram group/supergroup | group wallet | experimental | Telegram creator/administrator plus internal owner/admin mirror | no raw Telegram names stored; admin sync reports counts |
+| Telegram group/supergroup | group wallet | experimental | Telegram creator/administrator plus internal owner/admin mirror | user-wallet deposit/balance/history are never posted to groups; use `/groupwallet` for group wallets |
 | Telegram inline mode | user wallet confirmation entry | experimental | requester confirmation | preview-first; no paid execution from inline preview |
 | Discord DM | user wallet | experimental | wallet owner only | balance/deposit/history replies are ephemeral |
 | Discord guild | guild wallet | experimental | Manage Server or Administrator plus internal mirror | guild wallet balance/deposit are ephemeral unless `public=true` for deposit |
@@ -118,9 +118,10 @@ More diagrams:
 | `/deposit` | private | stable MVP |
 | `/balance` | private | stable MVP |
 | `/cap [show\|off\|amount]` | private | stable MVP |
-| `/research <query>` | private/group | stable MVP for private, experimental for group wallet execution |
-| `/enrich <email or company>` | private/group | stable MVP for private, experimental for group wallet execution |
-| `/generate <prompt>` | private/group | stable MVP for private, experimental for group wallet execution |
+| `/research <topic>` | private | agentic workflow demo |
+| `/search <query>` / `/exa <query>` | private | stable single-call Exa search |
+| `/enrich <email or company>` | private | stable MVP |
+| `/generate <prompt>` | private | stable MVP |
 | `/history` | private | stable MVP |
 | `/freeze` | private/group | stable MVP for private, experimental for group |
 | `/unfreeze` | private/group | stable MVP for private, experimental for group |
@@ -161,10 +162,15 @@ More diagrams:
 ```bash
 git clone https://github.com/akumoli-debug/agentcash-telegram.git
 cd agentcash-telegram
+nvm install
+nvm use
+corepack enable
 corepack pnpm install
 cp .env.example .env
 openssl rand -base64 32
 ```
+
+This repo is pinned to Node 22 LTS in `.nvmrc` and `package.json`. Use Node 22 before installing dependencies so `better-sqlite3` can load the correct native binding on macOS arm64.
 
 Put the generated 32-byte base64 key into `MASTER_ENCRYPTION_KEY`.
 
@@ -173,6 +179,7 @@ If `better-sqlite3` requires native build approval:
 ```bash
 corepack pnpm approve-builds
 corepack pnpm install
+corepack pnpm rebuild better-sqlite3
 ```
 
 Branch note: this checkout currently uses local branch `Main`, and both `origin/Main` and `origin/main` exist. The release branch should be canonical `main`.
@@ -245,9 +252,10 @@ Live Telegram steps:
 3. Confirm once if prompted.
 4. Press the same confirm button again and verify replay rejection.
 5. Run `/history`.
-6. In a group where the bot is admin, run `/groupwallet create`, `/groupwallet sync-admins`, `/groupwallet roles`, and `/groupwallet balance`.
-7. From a non-admin member, verify `/groupwallet create` and `/groupwallet cap` are refused.
-8. If inline mode is enabled in BotFather, type `@<bot username> research x402` and verify no paid call executes from the preview.
+6. In a group, verify `/start`, `/deposit`, `/balance`, `/history`, `/research`, and natural-language text return only the DM instruction and never wallet details.
+7. In a group where the bot is admin, run `/groupwallet create`, `/groupwallet sync-admins`, `/groupwallet roles`, and `/groupwallet balance`.
+8. From a non-admin member, verify `/groupwallet create` and `/groupwallet cap` are refused.
+9. If inline mode is enabled in BotFather, type `@<bot username> research x402` and verify no paid call executes from the preview.
 
 Live Discord steps:
 

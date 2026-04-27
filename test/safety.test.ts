@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppDatabase } from "../src/db/client.js";
-import { SkillExecutor, canonicalizeJson } from "../src/agentcash/skillExecutor.js";
+import { SkillExecutor, canonicalizeJson, usdcToCents } from "../src/agentcash/skillExecutor.js";
 import type { AppConfig } from "../src/config.js";
 import type { AppLogger } from "../src/lib/logger.js";
 import type { AgentCashClient } from "../src/agentcash/agentcashClient.js";
@@ -215,9 +215,14 @@ describe("Phase 2 - Immutable quote records", () => {
   it("creates a quote record before showing confirmation", async () => {
     const executor = makeExecutor(db, makeConfig(), {
       checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} })
+    }, {
+      getConfirmationCap: vi.fn().mockReturnValue(5)
     });
 
-    const result = await executor.execute("research", "x402 protocol", baseContext);
+    const result = await executor.execute("research", "x402 protocol", {
+      ...baseContext,
+      forceConfirmation: true
+    });
     expect(result.type).toBe("confirmation_required");
 
     if (result.type !== "confirmation_required") throw new Error("unreachable");
@@ -261,11 +266,14 @@ describe("Phase 3 - Confirm replay protection", () => {
   it("confirm executes exactly once", async () => {
     const fetchJson = vi.fn().mockResolvedValue({ raw: {}, data: {}, actualCostCents: 1 });
     const executor = makeExecutor(db, makeConfig(), {
-      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} }),
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 25, raw: {} }),
       fetchJson
     });
 
-    const result = await executor.execute("research", "x402 protocol", baseContext);
+    const result = await executor.execute("research", "x402 protocol", {
+      ...baseContext,
+      forceConfirmation: true
+    });
     if (result.type !== "confirmation_required") throw new Error("expected confirmation");
 
     const confirmed = await executor.executeApprovedQuote(result.quoteId, baseContext);
@@ -279,11 +287,14 @@ describe("Phase 3 - Confirm replay protection", () => {
   it("confirm replay does not execute twice", async () => {
     const fetchJson = vi.fn().mockResolvedValue({ raw: {}, data: {}, actualCostCents: 1 });
     const executor = makeExecutor(db, makeConfig(), {
-      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} }),
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 25, raw: {} }),
       fetchJson
     });
 
-    const result = await executor.execute("research", "x402 protocol", baseContext);
+    const result = await executor.execute("research", "x402 protocol", {
+      ...baseContext,
+      forceConfirmation: true
+    });
     if (result.type !== "confirmation_required") throw new Error("expected confirmation");
 
     await executor.executeApprovedQuote(result.quoteId, baseContext);
@@ -296,10 +307,13 @@ describe("Phase 3 - Confirm replay protection", () => {
 
   it("expired quote does not execute", async () => {
     const executor = makeExecutor(db, makeConfig({ PENDING_CONFIRMATION_TTL_SECONDS: 300 }), {
-      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} })
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 25, raw: {} })
     });
 
-    const result = await executor.execute("research", "x402 protocol", baseContext);
+    const result = await executor.execute("research", "x402 protocol", {
+      ...baseContext,
+      forceConfirmation: true
+    });
     if (result.type !== "confirmation_required") throw new Error("expected confirmation");
 
     db.sqlite
@@ -330,11 +344,14 @@ describe("Phase 5 - Concurrent confirm clicks only execute once", () => {
   it("concurrent confirm clicks only execute once", async () => {
     const fetchJson = vi.fn().mockResolvedValue({ raw: {}, data: {}, actualCostCents: 1 });
     const executor = makeExecutor(db, makeConfig(), {
-      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 100, raw: {} }),
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 25, raw: {} }),
       fetchJson
     });
 
-    const result = await executor.execute("research", "x402 protocol", baseContext);
+    const result = await executor.execute("research", "x402 protocol", {
+      ...baseContext,
+      forceConfirmation: true
+    });
     if (result.type !== "confirmation_required") throw new Error("expected confirmation");
 
     const [r1, r2] = await Promise.allSettled([
@@ -452,6 +469,8 @@ describe("Phase 4 - Cap exceeded logging", () => {
     const executor = makeExecutor(db, makeConfig(), {
       checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 200, raw: {} }),
       getBalance: vi.fn().mockResolvedValue({ usdcBalance: 0.001, raw: {} })
+    }, {
+      getConfirmationCap: vi.fn().mockReturnValue(5)
     });
 
     await expect(
@@ -460,6 +479,141 @@ describe("Phase 4 - Cap exceeded logging", () => {
 
     const preflights = db.sqlite.prepare("SELECT * FROM preflight_attempts WHERE failure_stage = 'balance'").all();
     expect(preflights).toHaveLength(1);
+  });
+
+  it("allows a quote under hard cap, wallet balance, and user cap", async () => {
+    const fetchJson = vi.fn().mockResolvedValue({ raw: {}, data: { results: [] }, actualCostCents: 25 });
+    const executor = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 25, raw: {} }),
+      fetchJson,
+      getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
+    }, {
+      getConfirmationCap: vi.fn().mockReturnValue(0.5)
+    });
+
+    const result = await executor.execute("research", "x402 protocol", baseContext);
+
+    expect(result.type).toBe("completed");
+    expect(fetchJson).toHaveBeenCalledTimes(1);
+    const quote = db.sqlite.prepare("SELECT quoted_cost_cents FROM quotes").get() as { quoted_cost_cents: number };
+    expect(quote.quoted_cost_cents).toBe(25);
+  });
+
+  it("denies a quote above the user per-call cap before the hard cap", async () => {
+    const executor = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 75, raw: {} }),
+      getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
+    }, {
+      getConfirmationCap: vi.fn().mockReturnValue(0.5)
+    });
+
+    await expect(executor.execute("research", "x402 protocol", baseContext))
+      .rejects.toThrow(/exceeds_user_cap/);
+
+    const preflight = db.sqlite.prepare("SELECT * FROM preflight_attempts ORDER BY id DESC LIMIT 1").get() as {
+      error_code: string;
+      failure_stage: string;
+    };
+    expect(preflight.failure_stage).toBe("cap");
+    expect(preflight.error_code).toBe("exceeds_user_cap");
+  });
+
+  it("checks cents at the user cap boundary", async () => {
+    expect(usdcToCents(5)).toBe(500);
+    expect(usdcToCents(0.5)).toBe(50);
+
+    const allowed = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 50, raw: {} }),
+      fetchJson: vi.fn().mockResolvedValue({ raw: {}, data: { results: [] }, actualCostCents: 50 }),
+      getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
+    }, {
+      getConfirmationCap: vi.fn().mockReturnValue(0.5)
+    });
+
+    await expect(allowed.execute("research", "x402 protocol", baseContext)).resolves.toMatchObject({
+      type: "completed"
+    });
+
+    db.close();
+    db = new AppDatabase(":memory:");
+    db.initialize();
+    db.sqlite.exec("INSERT INTO users (id, telegram_user_id, cap_enabled, default_spend_cap_usdc, created_at, updated_at) VALUES ('usr_test', '12345', 1, 0.5, datetime('now'), datetime('now'))");
+    db.sqlite.exec("INSERT INTO wallets (id, kind, owner_user_id, home_dir_hash, address, network, encrypted_private_key, status, created_at, updated_at) VALUES ('wal_test', 'user', 'usr_test', 'testhash', '0xABC', 'base', 'v1.iv.tag.ct', 'active', datetime('now'), datetime('now'))");
+
+    const denied = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 51, raw: {} }),
+      getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
+    }, {
+      getConfirmationCap: vi.fn().mockReturnValue(0.5)
+    });
+
+    await expect(denied.execute("research", "x402 protocol", baseContext))
+      .rejects.toThrow(/exceeds_user_cap/);
+  });
+
+  it("denies a quote above wallet balance when the user cap allows it", async () => {
+    const executor = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 125, raw: {} }),
+      getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
+    }, {
+      getConfirmationCap: vi.fn().mockReturnValue(5)
+    });
+
+    await expect(executor.execute("research", "x402 protocol", baseContext))
+      .rejects.toThrow(/exceeds_wallet_balance/);
+
+    const preflight = db.sqlite.prepare("SELECT * FROM preflight_attempts ORDER BY id DESC LIMIT 1").get() as {
+      error_code: string;
+      failure_stage: string;
+    };
+    expect(preflight.failure_stage).toBe("balance");
+    expect(preflight.error_code).toBe("exceeds_wallet_balance");
+  });
+
+  it("denies a quote above the hard cap before user cap or wallet balance", async () => {
+    const executor = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 600, raw: {} }),
+      getBalance: vi.fn().mockResolvedValue({ usdcBalance: 10, raw: {} })
+    }, {
+      getConfirmationCap: vi.fn().mockReturnValue(0.5)
+    });
+
+    await expect(executor.execute("research", "x402 protocol", baseContext))
+      .rejects.toThrow(/exceeds_hard_cap/);
+
+    const preflight = db.sqlite.prepare("SELECT * FROM preflight_attempts ORDER BY id DESC LIMIT 1").get() as {
+      error_code: string;
+      failure_stage: string;
+    };
+    expect(preflight.failure_stage).toBe("cap");
+    expect(preflight.error_code).toBe("exceeds_hard_cap");
+  });
+
+  it("reports missing quotes as quote_missing instead of hard cap", async () => {
+    const executor = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: undefined, raw: {} }),
+      getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
+    });
+
+    await expect(executor.execute("research", "x402 protocol", baseContext))
+      .rejects.toThrow(/quote_missing/);
+
+    const preflight = db.sqlite.prepare("SELECT * FROM preflight_attempts ORDER BY id DESC LIMIT 1").get() as {
+      error_code: string;
+      failure_stage: string;
+    };
+    expect(preflight.failure_stage).toBe("quote");
+    expect(preflight.error_code).toBe("quote_missing");
+  });
+
+  it("reports invalid quotes as quote_invalid", async () => {
+    const executor = makeExecutor(db, makeConfig({ HARD_SPEND_CAP_USDC: 5 }), {
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 0, raw: {} }),
+      getBalance: vi.fn().mockResolvedValue({ usdcBalance: 1, raw: {} })
+    });
+
+    await expect(executor.execute("research", "x402 protocol", baseContext))
+      .rejects.toThrow(/quote_invalid/);
   });
 
   it("/cap rejects values above the hard cap", async () => {

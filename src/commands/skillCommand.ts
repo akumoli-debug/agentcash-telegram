@@ -4,7 +4,12 @@ import type { AppConfig } from "../config.js";
 import { runSkillCommand } from "../core/commandHandlers.js";
 import type { AppDatabase } from "../db/client.js";
 import type { WalletManager } from "../wallets/walletManager.js";
-import { createTelegramCommandContext, getCommandArgument } from "./helpers.js";
+import {
+  createTelegramCommandContext,
+  getCommandArgument,
+  replyDmInstructionForUserWalletCommand,
+  isPrivateTelegramChat
+} from "./helpers.js";
 import { replyWithError } from "./replyWithError.js";
 
 export interface SkillCommandDeps {
@@ -31,6 +36,11 @@ export async function executeSkillRequest(
   rawInput: string,
   options?: { forceConfirmation?: boolean }
 ): Promise<void> {
+  if (!isPrivateTelegramChat(ctx)) {
+    await replyDmInstructionForUserWalletCommand(ctx);
+    return;
+  }
+
   await runSkillCommand(
     createTelegramCommandContext(ctx, deps.config),
     deps,

@@ -185,7 +185,7 @@ describe("database provider config", () => {
 
   it("Postgres adapter can run migrations when DATABASE_URL is provided", async () => {
     if (!process.env.DATABASE_URL) {
-      expect(process.env.DATABASE_URL).toBeUndefined();
+      expect(process.env.DATABASE_URL ?? "").toBe("");
       return;
     }
 

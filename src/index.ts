@@ -10,6 +10,7 @@ import { createBot } from "./bot.js";
 import { createDiscordBot, registerDiscordCommands } from "./discordBot.js";
 import { startHealthServer } from "./healthServer.js";
 import { createLockManager } from "./locks/LockManager.js";
+import { ResearchWorkflowService } from "./research/ResearchWorkflowService.js";
 
 const ALLOWED_TELEGRAM_UPDATES = [
   "message",
@@ -102,9 +103,10 @@ async function main() {
 
   const walletManager = new WalletManager(db, config, agentcashClient, lockManager);
   const skillExecutor = new SkillExecutor(db, walletManager, agentcashClient, logger, config, lockManager);
+  const researchWorkflowService = new ResearchWorkflowService(db, walletManager, agentcashClient, logger, config);
   const routerClient = new RouterClient(config, logger);
   const bot = config.TELEGRAM_BOT_TOKEN
-    ? createBot({ config, logger, db, walletManager, skillExecutor, routerClient })
+    ? createBot({ config, logger, db, walletManager, skillExecutor, researchWorkflowService, routerClient })
     : null;
   const discordBot = config.DISCORD_BOT_TOKEN
     ? createDiscordBot({ config, logger, db, walletManager, skillExecutor })

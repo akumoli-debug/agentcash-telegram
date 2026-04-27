@@ -203,7 +203,30 @@ export class AgentCashClient {
   }
 
   extractCostCents(raw: unknown): number | undefined {
-    const directPrice = this.extractPriceLikeValue(raw, ["price", "estimatedPrice", "cost", "amount"]);
+    const directCents = this.extractPriceLikeValue(raw, [
+      "estimatedCostCents",
+      "estimated_cost_cents",
+      "costCents",
+      "cost_cents",
+      "priceCents",
+      "price_cents"
+    ]);
+
+    if (typeof directCents === "number") {
+      return Math.round(directCents);
+    }
+
+    const directPrice = this.extractPriceLikeValue(raw, [
+      "priceUsd",
+      "price_usdc",
+      "estimatedPriceUsd",
+      "estimated_price_usdc",
+      "costUsd",
+      "cost_usdc",
+      "price",
+      "estimatedPrice",
+      "cost"
+    ]);
 
     if (typeof directPrice === "number") {
       return Math.round(directPrice * 100);
@@ -212,6 +235,18 @@ export class AgentCashClient {
     const paymentMethods = this.findArrayByKey(raw, ["paymentMethods", "payment_methods"]);
     if (paymentMethods) {
       for (const item of paymentMethods) {
+        const cents = this.extractPriceLikeValue(item, [
+          "estimatedCostCents",
+          "estimated_cost_cents",
+          "costCents",
+          "cost_cents",
+          "priceCents",
+          "price_cents"
+        ]);
+        if (typeof cents === "number") {
+          return Math.round(cents);
+        }
+
         const price = this.extractPriceLikeValue(item, ["price", "amount"]);
         if (typeof price === "number") {
           return Math.round(price * 100);

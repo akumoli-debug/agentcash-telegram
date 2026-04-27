@@ -25,7 +25,7 @@ function buildErrorMessage(error: unknown): string {
   }
 
   if (error instanceof InsufficientBalanceError) {
-    return "Insufficient balance. Use /deposit to fund your wallet, then try again.";
+    return error.message;
   }
 
   if (error instanceof QuoteError) {

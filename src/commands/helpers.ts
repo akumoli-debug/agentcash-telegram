@@ -9,6 +9,9 @@ import { hashSensitiveValue, hashTelegramId } from "../lib/crypto.js";
 import { AppError, ValidationError } from "../lib/errors.js";
 import type { TelegramProfile } from "../wallets/walletManager.js";
 
+export const USER_WALLET_DM_INSTRUCTION =
+  "For private wallet commands, DM me directly. In this group, use /groupwallet help.";
+
 const sessionQuoteStateSchema = z.object({
   type: z.literal("quote_confirmation"),
   quote_id: z.string().min(1)
@@ -31,6 +34,22 @@ export function getCommandArgument(ctx: Context): string {
 export function getTelegramProfile(ctx: Context): TelegramProfile {
   void ctx;
   return {};
+}
+
+export function isPrivateTelegramChat(ctx: Context): boolean {
+  return ctx.chat?.type === "private";
+}
+
+export function requirePrivateTelegramChat(ctx: Context): asserts ctx is Context & {
+  chat: NonNullable<Context["chat"]> & { type: "private" };
+} {
+  if (!isPrivateTelegramChat(ctx)) {
+    throw new ValidationError(USER_WALLET_DM_INSTRUCTION);
+  }
+}
+
+export async function replyDmInstructionForUserWalletCommand(ctx: Context): Promise<void> {
+  await ctx.reply(USER_WALLET_DM_INSTRUCTION);
 }
 
 export function getExecutionContext(ctx: Context): SkillExecutionContext {
@@ -74,9 +93,19 @@ export function createTelegramCommandContext(ctx: Context, config: AppConfig): C
       await ctx.reply(message);
     },
     replyPrivateOrEphemeral: async message => {
+      if (!isPrivateTelegramChat(ctx)) {
+        await replyDmInstructionForUserWalletCommand(ctx);
+        return;
+      }
+
       await ctx.reply(message);
     },
     confirm: async input => {
+      if (!isPrivateTelegramChat(ctx)) {
+        await replyDmInstructionForUserWalletCommand(ctx);
+        return;
+      }
+
       await ctx.reply(input.text, confirmationKeyboard(input.quoteId));
     }
   };

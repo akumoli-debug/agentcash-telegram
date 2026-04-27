@@ -4,13 +4,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AgentCashClient } from "../src/agentcash/agentcashClient.js";
-import { SkillExecutor } from "../src/agentcash/skillExecutor.js";
 import { parseConfig, type AppConfig } from "../src/config.js";
 import { buildDiscordCommandPayload } from "../src/discordBot.js";
 import { AppDatabase } from "../src/db/client.js";
 import { encryptSecret } from "../src/lib/crypto.js";
 import type { AppLogger } from "../src/lib/logger.js";
 import { startHealthServer } from "../src/healthServer.js";
+import { ResearchWorkflowService } from "../src/research/ResearchWorkflowService.js";
 import { WalletManager } from "../src/wallets/walletManager.js";
 
 interface SmokeOptions {
@@ -107,7 +107,7 @@ async function runDrySmoke(options: SmokeOptions): Promise<void> {
     step("health server starts, answers /healthz, and closes cleanly");
 
     await exerciseQuoteFlow(config, db);
-    step("quote and confirmation flow completes against a fake AgentCash client");
+    step("agentic research quote and confirmation flow completes against a fake AgentCash client");
 
     step("dry-run smoke complete");
   } finally {
@@ -132,18 +132,17 @@ async function verifyTelegramModulesImport(): Promise<void> {
 async function exerciseQuoteFlow(config: AppConfig, db: AppDatabase): Promise<void> {
   const fakeAgentCash = makeFakeAgentCashClient(config);
   const walletManager = new WalletManager(db, config, fakeAgentCash);
-  const skillExecutor = new SkillExecutor(db, walletManager, fakeAgentCash, logger, config);
+  const researchWorkflowService = new ResearchWorkflowService(db, walletManager, fakeAgentCash, logger, config);
 
-  const quote = await skillExecutor.execute("research", "x402 verification smoke", {
+  const quote = await researchWorkflowService.planAndQuote("x402 verification smoke", {
     telegramId: "dry-run-user",
     telegramChatId: "dry-run-user",
-    telegramChatType: "private",
-    forceConfirmation: true
+    telegramChatType: "private"
   });
 
   assert(quote.type === "confirmation_required", "expected a confirmation-required quote");
 
-  const result = await skillExecutor.executeApprovedQuote(quote.quoteId, {
+  const result = await researchWorkflowService.executeApprovedQuote(quote.quoteId, {
     telegramId: "dry-run-user",
     telegramChatId: "dry-run-user",
     telegramChatType: "private"
@@ -185,11 +184,11 @@ function makeFakeAgentCashClient(config: AppConfig): AgentCashClient {
       depositLink: "https://example.test/deposit",
       raw: { ok: true }
     }),
-    checkEndpoint: async () => ({ estimatedCostCents: 75, raw: { price: 0.75 } }),
+    checkEndpoint: async () => ({ estimatedCostCents: 25, raw: { price: 0.25 } }),
     fetchJson: async () => ({
       raw: { data: { results: [{ title: "Smoke result", url: "https://example.test" }] } },
       data: { results: [{ title: "Smoke result", url: "https://example.test" }] },
-      actualCostCents: 75,
+      actualCostCents: 25,
       txHash: "0xsmoke"
     }),
     pollJob: async () => ({ raw: {}, data: {}, actualCostCents: 0 }),
@@ -238,7 +237,7 @@ function printTelegramChecklist(): void {
   console.error("3. Run /deposit and /balance.");
   console.error("4. Run /cap 0.25.");
   console.error("5. Run /research latest x402 ecosystem activity.");
-  console.error("6. If quoted above cap, press Confirm once and verify a replayed Confirm is rejected.");
+  console.error("6. If a confirmation appears, press Confirm once and verify a replayed Confirm is rejected.");
   console.error("7. Run /history and verify the sanitized request hash and cost fields appear.");
   console.error("8. In a Telegram group, make the bot admin, then run /groupwallet create, /groupwallet sync-admins, /groupwallet roles, and /groupwallet balance.");
   console.error("9. From a non-admin group member, verify /groupwallet create and /groupwallet cap are refused.");

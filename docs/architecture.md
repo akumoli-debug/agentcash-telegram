@@ -5,7 +5,7 @@ The shipped MVP demo scope is Telegram private chat only: wallet funding details
 ## Runtime
 
 - TypeScript
-- Node 20+
+- Node 22 LTS
 - `pnpm` package management
 - `telegraf` for Telegram transport
 - `discord.js` for Discord transport

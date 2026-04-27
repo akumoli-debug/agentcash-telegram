@@ -5,6 +5,9 @@ This app can be deployed for demos and staging-like operation. It is not product
 ## Local Dev
 
 ```bash
+nvm install
+nvm use
+corepack enable
 cp .env.example .env
 openssl rand -base64 32
 corepack pnpm install

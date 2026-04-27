@@ -157,6 +157,8 @@ const skillDefinitions: Record<SkillName, SkillDefinition<string>> = {
 };
 
 const EXECUTION_LOCK_TTL_MS = 120_000;
+const QUOTE_MISSING_MESSAGE = "quote_missing: I could not get a reliable price quote, so I blocked execution.";
+const QUOTE_INVALID_MESSAGE = "quote_invalid: I could not get a reliable price quote, so I blocked execution.";
 
 export class SkillExecutor {
   constructor(
@@ -206,7 +208,7 @@ export class SkillExecutor {
       );
       this.assertGroupDailyCap(group, quotedCostCents, userHash, wallet.id, skill.name, requestHash);
 
-      const hardCapCents = Math.round(this.config.HARD_SPEND_CAP_USDC * 100);
+      const hardCapCents = usdcToCents(this.config.HARD_SPEND_CAP_USDC);
 
       if (!this.config.ALLOW_HIGH_VALUE_CALLS && quotedCostCents > hardCapCents) {
         this.db.logPreflightAttempt({
@@ -216,19 +218,49 @@ export class SkillExecutor {
           endpoint: skill.endpoint,
           requestHash,
           failureStage: "cap",
-          errorCode: "HARD_CAP_EXCEEDED",
+          errorCode: "exceeds_hard_cap",
           safeErrorMessage: "Request exceeds hard MVP safety cap"
         });
-        throw new SpendingCapError("This request exceeds the hard MVP safety cap.", {
-          quotedCostCents,
-          hardCapCents
-        });
+        throw new SpendingCapError(
+          `exceeds_hard_cap: This request is estimated at ${formatUsdCents(quotedCostCents)}, ` +
+          `above the hard MVP safety cap of ${formatUsdCents(hardCapCents)}.`,
+          {
+            guard: "exceeds_hard_cap",
+            quotedCostCents,
+            hardCapCents
+          }
+        );
       }
 
-      if (
-        typeof balance.usdcBalance === "number" &&
-        balance.usdcBalance * 100 < quotedCostCents
-      ) {
+      const confirmationCap = group
+        ? this.walletManager.getGroupConfirmationCap(group)
+        : this.walletManager.getConfirmationCap(user);
+      const userCapCents = !group && confirmationCap !== undefined ? usdcToCents(confirmationCap) : undefined;
+
+      if (userCapCents !== undefined && quotedCostCents > userCapCents) {
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: wallet.id,
+          skill: skill.name,
+          endpoint: skill.endpoint,
+          requestHash,
+          failureStage: "cap",
+          errorCode: "exceeds_user_cap",
+          safeErrorMessage: "Request exceeds user per-call cap"
+        });
+        throw new SpendingCapError(
+          `exceeds_user_cap: This request is estimated at ${formatUsdCents(quotedCostCents)}, ` +
+          `above your per-call cap of ${formatUsdCents(userCapCents)}.`,
+          {
+            guard: "exceeds_user_cap",
+            quotedCostCents,
+            userCapCents
+          }
+        );
+      }
+
+      const balanceCents = usdcBalanceToCents(balance.usdcBalance);
+      if (balanceCents !== undefined && balanceCents < quotedCostCents) {
         this.db.logPreflightAttempt({
           userHash,
           walletId: wallet.id,
@@ -236,13 +268,19 @@ export class SkillExecutor {
           endpoint: skill.endpoint,
           requestHash,
           failureStage: "balance",
-          errorCode: "INSUFFICIENT_BALANCE",
+          errorCode: "exceeds_wallet_balance",
           safeErrorMessage: "Wallet balance below quoted cost"
         });
-        throw new InsufficientBalanceError("Your AgentCash wallet does not have enough balance.", {
-          balanceUsdc: balance.usdcBalance,
-          quotedCostCents
-        });
+        throw new InsufficientBalanceError(
+          `exceeds_wallet_balance: This request is estimated at ${formatUsdCents(quotedCostCents)}, ` +
+          `but your wallet balance is ${formatUsdCents(balanceCents)}.`,
+          {
+            guard: "exceeds_wallet_balance",
+            balanceCents,
+            balanceUsdc: balance.usdcBalance,
+            quotedCostCents
+          }
+        );
       }
 
       const maxApprovedCostCents = Math.min(Math.max(quotedCostCents * 2, quotedCostCents + 10), hardCapCents);
@@ -250,13 +288,10 @@ export class SkillExecutor {
         Date.now() + this.config.PENDING_CONFIRMATION_TTL_SECONDS * 1000
       ).toISOString();
 
-      const confirmationCap = group
-        ? this.walletManager.getGroupConfirmationCap(group)
-        : this.walletManager.getConfirmationCap(user);
       const requiresGroupAdminApproval =
         Boolean(group) &&
         confirmationCap !== undefined &&
-        quotedCostCents > Math.round(confirmationCap * 100);
+        quotedCostCents > usdcToCents(confirmationCap);
 
       const quote = this.db.createQuote({
         userHash,
@@ -279,7 +314,7 @@ export class SkillExecutor {
 
       const needsConfirmation =
         context.forceConfirmation ||
-        (confirmationCap !== undefined && quotedCostCents > Math.round(confirmationCap * 100));
+        (Boolean(group) && confirmationCap !== undefined && quotedCostCents > usdcToCents(confirmationCap));
 
       if (needsConfirmation) {
         const costLine = isDevUnquoted
@@ -288,8 +323,8 @@ export class SkillExecutor {
         const capLine =
           confirmationCap !== undefined
             ? group
-              ? `This group's per-call cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
-              : `Your per-call confirmation cap is ${formatUsdCents(Math.round(confirmationCap * 100))}.`
+              ? `This group's per-call cap is ${formatUsdCents(usdcToCents(confirmationCap))}.`
+              : `Your per-call cap is ${formatUsdCents(usdcToCents(confirmationCap))}.`
             : "Natural language requests always require confirmation.";
         const approvalLine = requiresGroupAdminApproval
           ? "Because this is over the group cap, an owner or admin must confirm."
@@ -369,7 +404,36 @@ export class SkillExecutor {
         throw new QuoteError("This confirmation does not belong to your account.");
       }
 
+      if (!group && context.telegramChatType && context.telegramChatType !== "private") {
+        this.db.logPreflightAttempt({
+          userHash,
+          walletId: quote.wallet_id,
+          skill: quote.skill,
+          failureStage: "replay",
+          errorCode: "USER_QUOTE_CONFIRMED_FROM_GROUP",
+          safeErrorMessage: "User wallet quote confirmed from a non-private chat"
+        });
+        throw new QuoteError("Private wallet confirmations must be completed in a DM with the bot.");
+      }
+
       if (group) {
+        if (
+          group.platform === "telegram" &&
+          context.telegramChatType &&
+          context.telegramChatType !== "group" &&
+          context.telegramChatType !== "supergroup"
+        ) {
+          this.db.logPreflightAttempt({
+            userHash,
+            walletId: quote.wallet_id,
+            skill: quote.skill,
+            failureStage: "replay",
+            errorCode: "GROUP_QUOTE_CONFIRMED_OUTSIDE_GROUP",
+            safeErrorMessage: "Group quote confirmed outside a Telegram group"
+          });
+          throw new QuoteError("This group confirmation is no longer valid.");
+        }
+
         if (group.telegram_chat_id_hash !== chatHash) {
           this.db.logPreflightAttempt({
             userHash,
@@ -557,13 +621,27 @@ export class SkillExecutor {
   ): Promise<{ quotedCostCents: number; isDevUnquoted: boolean }> {
     try {
       const checkResult = await this.agentcashClient.checkEndpoint(wallet, skill.endpoint, body);
+      const quotedCostCents = checkResult.estimatedCostCents;
 
-      if (checkResult.estimatedCostCents === undefined) {
-        throw new QuoteError("AgentCash did not return a bounded cost estimate.");
+      if (quotedCostCents === undefined) {
+        this.logQuoteFailure(userHash, wallet.id, skill, requestHash, "quote_missing", "AgentCash quote/check did not return a price");
+        throw new QuoteError(QUOTE_MISSING_MESSAGE, { guard: "quote_missing" });
       }
 
-      return { quotedCostCents: checkResult.estimatedCostCents, isDevUnquoted: false };
+      if (!Number.isSafeInteger(quotedCostCents) || quotedCostCents <= 0) {
+        this.logQuoteFailure(userHash, wallet.id, skill, requestHash, "quote_invalid", "AgentCash quote/check returned an invalid price");
+        throw new QuoteError(QUOTE_INVALID_MESSAGE, {
+          guard: "quote_invalid",
+          quotedCostCents
+        });
+      }
+
+      return { quotedCostCents, isDevUnquoted: false };
     } catch (error) {
+      if (error instanceof QuoteError) {
+        throw error;
+      }
+
       if (this.config.ALLOW_UNQUOTED_DEV_CALLS) {
         this.logger.warn(
           { skill: skill.name, userHash, requestHash },
@@ -572,21 +650,40 @@ export class SkillExecutor {
         return { quotedCostCents: 0, isDevUnquoted: true };
       }
 
-      this.db.logPreflightAttempt({
+      this.logQuoteFailure(
         userHash,
-        walletId: wallet.id,
-        skill: skill.name,
-        endpoint: skill.endpoint,
+        wallet.id,
+        skill,
         requestHash,
-        failureStage: "quote",
-        errorCode: error instanceof Error ? (error as { code?: string }).code ?? "QUOTE_FAILED" : "QUOTE_FAILED",
-        safeErrorMessage: "AgentCash quote/check failed"
-      });
-
-      throw new QuoteError(
-        "I couldn't safely quote this request, so I didn't run it. Please try again."
+        "quote_missing",
+        "AgentCash quote/check failed"
       );
+
+      throw new QuoteError(QUOTE_MISSING_MESSAGE, {
+        guard: "quote_missing",
+        cause: error instanceof Error ? error.message : String(error)
+      });
     }
+  }
+
+  private logQuoteFailure(
+    userHash: string,
+    walletId: string,
+    skill: SkillDefinition<string>,
+    requestHash: string,
+    errorCode: "quote_missing" | "quote_invalid",
+    safeErrorMessage: string
+  ): void {
+    this.db.logPreflightAttempt({
+      userHash,
+      walletId,
+      skill: skill.name,
+      endpoint: skill.endpoint,
+      requestHash,
+      failureStage: "quote",
+      errorCode,
+      safeErrorMessage
+    });
   }
 
   private async _runApprovedQuote(
@@ -855,4 +952,16 @@ function pickFirstString(object: Record<string, unknown>, keys: string[]): strin
 
 export function formatUsdCents(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
+}
+
+export function usdcToCents(amount: number): number {
+  return Math.round(amount * 100);
+}
+
+function usdcBalanceToCents(amount: number | undefined): number | undefined {
+  if (typeof amount !== "number" || !Number.isFinite(amount)) {
+    return undefined;
+  }
+
+  return usdcToCents(amount);
 }

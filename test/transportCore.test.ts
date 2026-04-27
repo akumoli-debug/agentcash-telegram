@@ -147,7 +147,9 @@ describe("transport-neutral command layer", () => {
     db = new AppDatabase(":memory:");
     db.initialize();
     const config = makeConfig();
-    const ac = makeAgentCashClient();
+    const ac = makeAgentCashClient({
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 25, raw: {} })
+    });
     const walletManager = new WalletManager(db, config, ac);
     const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
     const discordCtx = makeContext("discord");
@@ -156,7 +158,8 @@ describe("transport-neutral command layer", () => {
       discordCtx,
       { config, db, walletManager, skillExecutor },
       "research",
-      "x402 adoption"
+      "x402 adoption",
+      { forceConfirmation: true }
     );
 
     expect(discordCtx.confirmations).toHaveLength(1);
@@ -169,7 +172,9 @@ describe("transport-neutral command layer", () => {
     db = new AppDatabase(":memory:");
     db.initialize();
     const config = makeConfig();
-    const ac = makeAgentCashClient();
+    const ac = makeAgentCashClient({
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 25, raw: {} })
+    });
     const walletManager = new WalletManager(db, config, ac);
     const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
     const discordCtx = makeContext("discord");
@@ -178,7 +183,8 @@ describe("transport-neutral command layer", () => {
       discordCtx,
       { config, db, walletManager, skillExecutor },
       "research",
-      "x402 adoption"
+      "x402 adoption",
+      { forceConfirmation: true }
     );
 
     const quoteId = discordCtx.confirmations[0]!;
@@ -302,12 +308,20 @@ describe("transport-neutral command layer", () => {
     db = new AppDatabase(":memory:");
     db.initialize();
     const config = makeConfig();
-    const ac = makeAgentCashClient();
+    const ac = makeAgentCashClient({
+      checkEndpoint: vi.fn().mockResolvedValue({ estimatedCostCents: 25, raw: {} })
+    });
     const walletManager = new WalletManager(db, config, ac);
     const skillExecutor = new SkillExecutor(db, walletManager, ac, silentLogger, config);
     const discordCtx = makeContext("discord");
 
-    await runSkillCommand(discordCtx, { config, db, walletManager, skillExecutor }, "research", "x402 adoption");
+    await runSkillCommand(
+      discordCtx,
+      { config, db, walletManager, skillExecutor },
+      "research",
+      "x402 adoption",
+      { forceConfirmation: true }
+    );
 
     await expect(
       skillExecutor.executeApprovedQuote(discordCtx.confirmations[0]!, {

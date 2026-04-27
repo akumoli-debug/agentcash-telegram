@@ -6,29 +6,38 @@ import { validateProductionConfig } from "./configValidation.js";
 
 loadDotEnv();
 
+const optionalString = z.preprocess(
+  value => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().trim().optional()
+);
+const optionalUrl = z.preprocess(
+  value => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().url().optional()
+);
+
 const envSchema = z
   .object({
-    TELEGRAM_BOT_TOKEN: z.string().trim().optional(),
-    TELEGRAM_BOT_USERNAME: z.string().trim().optional(),
-    DISCORD_BOT_TOKEN: z.string().trim().optional(),
-    DISCORD_APPLICATION_ID: z.string().trim().optional(),
-    DISCORD_DEV_GUILD_ID: z.string().trim().optional(),
+    TELEGRAM_BOT_TOKEN: optionalString,
+    TELEGRAM_BOT_USERNAME: optionalString,
+    DISCORD_BOT_TOKEN: optionalString,
+    DISCORD_APPLICATION_ID: optionalString,
+    DISCORD_DEV_GUILD_ID: optionalString,
     DATABASE_PROVIDER: z.enum(["sqlite", "postgres"]).default("sqlite"),
     DATABASE_PATH: z.string().default(".data/agentcash-telegram.db"),
-    DATABASE_URL: z.string().trim().optional(),
+    DATABASE_URL: optionalString,
     ALLOW_SQLITE_IN_PRODUCTION: z
       .union([z.literal("true"), z.literal("false"), z.boolean()])
       .default("false")
       .transform(value => value === true || value === "true"),
     LOCK_PROVIDER: z.enum(["local", "redis"]).default("local"),
-    REDIS_URL: z.string().trim().optional(),
+    REDIS_URL: optionalString,
     ALLOW_LOCAL_LOCKS_IN_PRODUCTION: z
       .union([z.literal("true"), z.literal("false"), z.boolean()])
       .default("false")
       .transform(value => value === true || value === "true"),
     AUDIT_SINK: z.enum(["database", "file", "http"]).default("database"),
     AUDIT_FILE_PATH: z.string().default(".data/audit-events.jsonl"),
-    AUDIT_HTTP_ENDPOINT: z.string().url().optional(),
+    AUDIT_HTTP_ENDPOINT: optionalUrl,
     ALLOW_DATABASE_AUDIT_IN_PRODUCTION: z
       .union([z.literal("true"), z.literal("false"), z.boolean()])
       .default("false")
@@ -40,11 +49,11 @@ const envSchema = z
       .transform(value => value === true || value === "true"),
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     BOT_MODE: z.enum(["polling", "webhook"]).default("polling"),
-    WEBHOOK_DOMAIN: z.string().trim().optional(),
+    WEBHOOK_DOMAIN: optionalString,
     WEBHOOK_PATH: z.string().default("/telegram/webhook"),
     WEBHOOK_HOST: z.string().default("0.0.0.0"),
     WEBHOOK_PORT: z.coerce.number().int().positive().default(3000),
-    WEBHOOK_SECRET_TOKEN: z.string().trim().optional(),
+    WEBHOOK_SECRET_TOKEN: optionalString,
     HEALTH_HOST: z.string().default("0.0.0.0"),
     HEALTH_PORT: z.coerce.number().int().min(0).default(3001),
     AGENTCASH_COMMAND: z.string().default("npx"),
@@ -71,7 +80,7 @@ const envSchema = z
       .union([z.literal("true"), z.literal("false"), z.boolean()])
       .default("false")
       .transform(value => value === true || value === "true"),
-    REMOTE_SIGNER_URL: z.string().url().optional(),
+    REMOTE_SIGNER_URL: optionalUrl,
     PENDING_CONFIRMATION_TTL_SECONDS: z.coerce.number().int().positive().default(300),
     RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().int().positive().default(30),
     RATE_LIMIT_MAX_PER_HOUR: z.coerce.number().int().positive().default(100),
@@ -81,12 +90,16 @@ const envSchema = z
     GLOBAL_PAID_CALL_CONCURRENCY: z.coerce.number().int().positive().default(4),
     GROUP_DAILY_CAP_USDC: z.coerce.number().positive().default(25),
     AGENTCASH_HOME_ROOT: z.string().default("data/agentcash-homes"),
-    OPENAI_API_KEY: z.string().trim().optional(),
+    OPENAI_API_KEY: optionalString,
     OPENAI_ROUTER_MODEL: z.string().default("gpt-5.4-mini"),
-    ANTHROPIC_API_KEY: z.string().trim().optional(),
+    ANTHROPIC_API_KEY: optionalString,
     ANTHROPIC_ROUTER_MODEL: z.string().default("claude-sonnet-4-20250514"),
     ROUTER_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.75),
     ROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+    RESEARCH_WORKFLOW_DEMO_MODE: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .default("true")
+      .transform(value => value === true || value === "true"),
     MASTER_ENCRYPTION_KEY: z
       .string()
       .min(1, "MASTER_ENCRYPTION_KEY is required")

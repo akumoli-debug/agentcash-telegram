@@ -15,7 +15,7 @@ Every paid call must satisfy all of the following before execution:
 3. The exact approved request (stored as canonical JSON) is the one executed — not re-parsed user input.
 4. The quote has not expired.
 5. The selected wallet balance covers the quoted cost.
-6. The call is within the user or group confirmation cap and the hard MVP safety cap.
+6. The call is within the user or group per-call cap and the hard MVP safety cap.
 7. The execution attempt is durably logged in `preflight_attempts`.
 
 If any of these are false, the call fails safely. The failure is logged in `preflight_attempts`.
@@ -51,6 +51,10 @@ If 0 rows are changed, the confirm is rejected (replay protection). Execution th
 ## Wallet isolation model
 
 - Each Telegram user gets a distinct AgentCash wallet context.
+- Telegram user-wallet commands are private-chat only: `/start`, `/deposit`, `/balance`, `/cap`, `/history`, `/research`, `/enrich`, and `/generate` refuse group, supergroup, and channel execution.
+- If a private-wallet command is attempted in a group, the bot replies only: `For private wallet commands, DM me directly. In this group, use /groupwallet help.`
+- User-wallet deposit addresses, balances, and history details are never posted to Telegram groups. Group chats must use `/groupwallet` commands for shared wallet operations.
+- Telegram natural-language routing is private-chat only. Group text is not routed to paid user-wallet skills.
 - Wallet home directories are named `<AGENTCASH_HOME_ROOT>/<user_hash>/` where `user_hash` is a keyed HMAC of the Telegram ID — never the raw Telegram ID.
 - Experimental roadmap group wallet home directories are named with a keyed HMAC of the chat ID, not the raw chat ID.
 - SQLite stores wallet metadata. Local/demo private key material is encrypted at rest with AES-256-GCM using `MASTER_ENCRYPTION_KEY`.
@@ -161,7 +165,7 @@ No raw request bodies or user input is logged.
 
 ## Spending caps
 
-- Default per-call confirmation cap: `$0.50` (configurable via `/cap`)
+- Default per-call cap: `$0.50` (configurable via `/cap`)
 - Hard MVP ceiling: `$5.00` unless `ALLOW_HIGH_VALUE_CALLS=true`
 - Natural-language routed calls always require explicit confirmation regardless of cap.
 - Cap denials are logged in `preflight_attempts`.
@@ -182,6 +186,7 @@ No raw request bodies or user input is logged.
 - SQL-level atomic approve prevents double-execution even under concurrent callbacks.
 - Paid execution also requires an atomic `approved -> executing` quote transition and a unique transaction `idempotency_key`.
 - Session state stores only `quote_id`, not raw input. Confirm handler verifies the quote ID matches the session before proceeding.
+- User-wallet quote confirmations must happen in a private chat by the original requester. Group-wallet quote confirmations may happen in the matching Telegram group only, and over-cap group confirmations require an owner/admin with fresh Telegram admin verification.
 - Group wallets, inline mode, and Discord are experimental code paths and are not part of the shipped Telegram private-chat MVP demo.
 
 ---

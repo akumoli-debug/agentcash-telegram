@@ -93,7 +93,7 @@ export async function runCapCommand(
 
     await ctx.replyPrivateOrEphemeral(
       [
-        "Per-call confirmation cap is now off.",
+        "Per-call cap is now off.",
         `Hard safety cap remains ${formatUsdAmount(deps.config.HARD_SPEND_CAP_USDC)}.`
       ].join("\n")
     );
@@ -119,7 +119,7 @@ export async function runCapCommand(
 
   await ctx.replyPrivateOrEphemeral(
     [
-      `Per-call confirmation cap set to ${formatUsdAmount(parsedAmount.data)}.`,
+      `Per-call cap set to ${formatUsdAmount(parsedAmount.data)}.`,
       `Hard safety cap: ${formatUsdAmount(deps.config.HARD_SPEND_CAP_USDC)}.`
     ].join("\n")
   );
@@ -188,7 +188,7 @@ export async function runSkillCommand(
   }
 
   deps.db.clearSessionState(user.id, ctx.walletScope.chatId);
-  await ctx.reply(result.text);
+  await ctx.replyPrivateOrEphemeral(result.text);
 }
 
 export function ensureSupportedWalletScope(ctx: CommandContext): void {

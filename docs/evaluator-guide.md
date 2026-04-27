@@ -9,6 +9,9 @@ This guide is the quickest way to understand the v0.1 package without reading ev
 3. Run:
 
 ```bash
+nvm install
+nvm use
+corepack enable
 corepack pnpm install
 corepack pnpm test
 corepack pnpm smoke:dry

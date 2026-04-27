@@ -52,7 +52,7 @@ The recon suggested:
 
 ## Recommended integration approach
 
-- Use TypeScript with Node 20+
+- Use TypeScript with Node 22 LTS
 - Use AgentCash via CLI subprocess calls
 - Isolate each Telegram user under `data/agentcash-homes/<telegram_id_hash>/`
 - Store only safe wallet metadata in SQLite

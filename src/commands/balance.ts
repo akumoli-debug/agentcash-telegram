@@ -4,7 +4,7 @@ import type { AppConfig } from "../config.js";
 import type { AppDatabase } from "../db/client.js";
 import { runBalanceCommand } from "../core/commandHandlers.js";
 import { WalletManager } from "../wallets/walletManager.js";
-import { createTelegramCommandContext } from "./helpers.js";
+import { createTelegramCommandContext, replyDmInstructionForUserWalletCommand, isPrivateTelegramChat } from "./helpers.js";
 import { replyWithError } from "./replyWithError.js";
 
 export function createBalanceCommand(deps: {
@@ -15,6 +15,11 @@ export function createBalanceCommand(deps: {
 }) {
   return async (ctx: Context) => {
     try {
+      if (!isPrivateTelegramChat(ctx)) {
+        await replyDmInstructionForUserWalletCommand(ctx);
+        return;
+      }
+
       await runBalanceCommand(createTelegramCommandContext(ctx, deps.config), deps);
     } catch (error) {
       await replyWithError(ctx, error);
