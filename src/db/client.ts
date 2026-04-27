@@ -424,7 +424,7 @@ export class AppDatabase {
 
   initialize() {
     for (const statement of schemaStatements) {
-      this.sqlite.exec(statement);
+      this.executeSchemaStatement(statement);
     }
 
     this.ensureWalletColumn("home_dir_hash", "TEXT");
@@ -2705,6 +2705,25 @@ export class AppDatabase {
          LIMIT ?`
       )
       .all(id, sinceIso, limit) as TransactionExportRow[];
+  }
+
+  private executeSchemaStatement(statement: string) {
+    try {
+      this.sqlite.exec(statement);
+    } catch (error) {
+      const isIndexStatement = /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(statement);
+      const isMissingColumn =
+        error instanceof Error &&
+        "code" in error &&
+        (error as { code?: string }).code === "SQLITE_ERROR" &&
+        /no such column:/i.test(error.message);
+
+      if (isIndexStatement && isMissingColumn) {
+        return;
+      }
+
+      throw error;
+    }
   }
 
   private ensureWalletColumn(name: string, type: string) {

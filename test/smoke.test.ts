@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { getConfig, parseConfig } from "../src/config.js";
 import { assertRuntimeDatabaseAdapterImplemented } from "../src/db/DatabaseAdapter.js";
+import { AppDatabase } from "../src/db/client.js";
 import { decryptSecret, encryptSecret, hashTelegramId } from "../src/lib/crypto.js";
 import { startHealthServer } from "../src/healthServer.js";
 import type { AppConfig } from "../src/config.js";
@@ -101,6 +102,42 @@ describe("config", () => {
         AUDIT_SINK: "file"
       })
     ).toThrow(/SKIP_AGENTCASH_HEALTHCHECK must be false/);
+  });
+});
+
+describe("SQLite startup migration", () => {
+  it("adds new quote reconciliation columns before creating dependent indexes", () => {
+    const db = new AppDatabase(":memory:");
+    db.sqlite.exec(`
+      CREATE TABLE quotes (
+        id TEXT PRIMARY KEY,
+        user_hash TEXT NOT NULL,
+        wallet_id TEXT NOT NULL,
+        skill TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        canonical_request_json TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        quoted_cost_cents INTEGER NOT NULL,
+        max_approved_cost_cents INTEGER NOT NULL,
+        is_dev_unquoted INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        approved_at TEXT,
+        executed_at TEXT,
+        transaction_id TEXT
+      )
+    `);
+
+    db.initialize();
+
+    const columns = db.sqlite.prepare("PRAGMA table_info(quotes)").all() as Array<{ name: string }>;
+    expect(columns.map(column => column.name)).toContain("execution_lease_expires_at");
+
+    const indexes = db.sqlite.prepare("PRAGMA index_list(quotes)").all() as Array<{ name: string }>;
+    expect(indexes.map(index => index.name)).toContain("quotes_execution_reconciliation_idx");
+
+    db.close();
   });
 });
 
